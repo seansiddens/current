@@ -1,1 +1,1 @@
-kernels/generated/
+kernels/generated/*.cpp
