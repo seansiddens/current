@@ -64,6 +64,15 @@ class Map {
     void execute();
     void generate_device_kernels();
 
+    // Visualize the work graph.
+    // For PNG
+    // dot -Tpng filename.dot -o filename.png
+    // For SVG (better for web/documentation)
+    // dot -Tsvg filename.dot -o filename.svg
+    // For PDF (better for papers/presentations)
+    // dot -Tpdf filename.dot -o filename.pdf
+    void export_dot(const std::string& filename) const;
+
   private:
     struct Runtime {
         tt_metal::Device *device;

@@ -336,4 +336,47 @@ void Map::generate_device_kernels() {
     }
 }
 
+void Map::export_dot(const std::string& filename) const {
+    std::ofstream dot_file(filename);
+    
+    // Header
+    dot_file << "digraph StreamGraph {\n";
+    dot_file << "    rankdir=LR;\n";  // Left to right layout
+    
+    // Style definitions
+    dot_file << "    node [shape=box, style=filled];\n";
+    
+    // Define nodes
+    for (size_t i = 0; i < kernels.size(); i++) {
+        dot_file << "    kernel_" << i << " [label=\"Kernel " << i << "\", fillcolor=lightblue];\n";
+    }
+    for (size_t i = 0; i < streams.size(); i++) {
+        dot_file << "    stream_" << i << " [label=\"Stream " << i << "\", fillcolor=green];\n";
+    }
+    
+    // Define edges
+    for (const auto& conn : connections) {
+        std::string src_name = conn.source.is_kernel() ? 
+            "kernel_" + std::to_string(conn.source.index) :
+            "stream_" + std::to_string(conn.source.index);
+            
+        std::string dst_name = conn.dest.is_kernel() ? 
+            "kernel_" + std::to_string(conn.dest.index) :
+            "stream_" + std::to_string(conn.dest.index);
+        
+        // Add port labels if they exist
+        std::string label;
+        if (!conn.source.port.empty() || !conn.dest.port.empty()) {
+            label = " [label=\"" + 
+                (conn.source.port.empty() ? "source" : conn.source.port) + " → " +
+                (conn.dest.port.empty() ? "sink" : conn.dest.port) + "\"]";
+        }
+        
+        dot_file << "    " << src_name << " -> " << dst_name << label << ";\n";
+    }
+    
+    dot_file << "}\n";
+    dot_file.close();
+}
+
 } // End namespace stream

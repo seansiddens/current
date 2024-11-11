@@ -155,16 +155,17 @@ int main(int argc, char **argv) {
     CBHandle cb_out = MakeCircularBufferBFP16(program, core_set, tt::CB::c_out0, tiles_per_cb);
 
     // Kernel generation.
-    stream::Kernel reader_kernel;
+    stream::Kernel reader_kernel0;
     // TODO: Automatically assign CBs to kernels? Also have a typed port? 
-    reader_kernel.add_input_port("in0", tt::CB::c_in0);
-    reader_kernel.add_output_port("out0", tt::CB::c_out0);
+    reader_kernel0.add_input_port("in0", tt::CB::c_in0);
+    reader_kernel0.add_output_port("out0", tt::CB::c_out0);
     stream::Stream source(generator_data, count, sizeof(bfloat16));
     stream::Stream sink(output_data, count, sizeof(bfloat16));
 
-    stream::Map map({&reader_kernel}, {&source, &sink});
-    map.add_connection(&source, &reader_kernel, "in0");
-    map.add_connection(&reader_kernel, "out0", &sink);
+    stream::Map map({&reader_kernel0}, {&source, &sink});
+    map.add_connection(&source, &reader_kernel0, "in0");
+    map.add_connection(&reader_kernel0, "out0", &sink);
+    map.export_dot("stream_graph.dot");
 
     return 0;
 
