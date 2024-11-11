@@ -1,18 +1,20 @@
 #pragma once
 
-#include <utility>
-#include <unordered_map>
 #include <vector>
+#include <filesystem>
 
 #include "impl/buffers/buffer.hpp"
 #include "tt_metal/host_api.hpp"
-#include "common/bfloat16.hpp"
 
 #include "common.hpp"
 
 using namespace tt;
 
 namespace stream {
+
+const std::filesystem::path GENERATED_KERNELS_PATH = "tt_metal/programming_examples/personal/current/kernels/generated";
+
+using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
 
 // Wrapper around a DRAM buffer. Used as source and dest of stream data for kernels.
 class Stream {
@@ -84,6 +86,13 @@ class Kernel {
     // the pipelining.
     std::vector<Port> input_ports;
     std::vector<Port> output_ports;
+    CoreSpec core_spec; // Where this kernel will be placed.
+    tt_metal::KernelHandle reader_kernel;
+    tt_metal::KernelHandle compute_kernel;
+    tt_metal::KernelHandle writer_kernel;
+    std::filesystem::path generated_reader_kernel_path;
+    std::filesystem::path generated_compute_kernel_path;
+    std::filesystem::path generated_writer_kernel_path;
 };
 
 class Map {

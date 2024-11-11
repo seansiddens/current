@@ -64,7 +64,8 @@ void Map::execute() {
 
     // 2. Core grid setup.
     // TODO: Have this configurable by user and dyanmic by runtime scheduling.
-    runtime.num_cores = 1;
+    // Write now just set to # of kernels we have.
+    runtime.num_cores = kernels.size();
     auto compute_with_storage_grid_size = runtime.device->compute_with_storage_grid_size();
     runtime.num_cores_x = compute_with_storage_grid_size.x;
     runtime.num_cores_y = compute_with_storage_grid_size.y;
@@ -101,7 +102,32 @@ void Map::execute() {
     //     }
     // }
 
+    // 4. Generate device kernels.
     generate_device_kernels();
+
+    std::vector<CoreCoord> cores;
+    for (const CoreRange& range : runtime.core_set) {
+        for (const CoreCoord& core : range) {
+            cores.push_back(core);
+        }
+    }
+
+    for (size_t i = 0; i < kernels.size(); i++) {
+        auto kernel = kernels[i];
+
+        // Each kernel gets mapped to a single core. 
+        // We just assign to the next available core.
+        // TODO: Look into core placement strategies (RaftLib thesis)
+        kernel->core_spec = cores[i];
+
+        // Create device kernels.
+        // auto reader = tt_metal::CreateKernel(
+        //     runtime.program,
+        //     GENERATED_KERNELS_PATH / "reader.cpp",
+        // );
+    }
+
+
 }
 
 bool Map::has_incoming_connection(Kernel *kernel) {
@@ -238,10 +264,12 @@ void Map::generate_reader_device_kernel(
     rs << "}\n";
     rs << "\n";
 
-    const std::string generated_reader_kernel_path = "tt_metal/programming_examples/personal/current/kernels/generated/reader.cpp";
-    auto reader_kernel_file = std::ofstream(generated_reader_kernel_path);
+    std::string filename = "reader" + std::to_string(get_kernel_index(kernel)) + ".cpp";
+    kernel->generated_reader_kernel_path = GENERATED_KERNELS_PATH / filename;
+    auto reader_kernel_file = std::ofstream(kernel->generated_reader_kernel_path);
     if (!reader_kernel_file.is_open()) {
-        tt::log_error("Failed to open file for writing: {}", generated_reader_kernel_path);
+        tt::log_error("Failed to open file for writing: {}", kernel->generated_reader_kernel_path);
+        exit(1);
     }
     reader_kernel_file << rs.str();
     reader_kernel_file.close();
@@ -393,10 +421,12 @@ void Map::generate_compute_device_kernel(
     cs << "\n";
 
     // Save to file.
-    const std::string generated_compute_kernel_path = "tt_metal/programming_examples/personal/current/kernels/generated/compute.cpp";
-    auto compute_kernel_file = std::ofstream(generated_compute_kernel_path);
+    std::string filename = "compute" + std::to_string(get_kernel_index(kernel)) + ".cpp";
+    kernel->generated_compute_kernel_path = GENERATED_KERNELS_PATH / filename;
+    auto compute_kernel_file = std::ofstream(kernel->generated_compute_kernel_path);
     if (!compute_kernel_file.is_open()) {
-        tt::log_error("Failed to open file for writing: {}", generated_compute_kernel_path);
+        tt::log_error("Failed to open file for writing: {}", kernel->generated_compute_kernel_path);
+        exit(1);
     }
     compute_kernel_file << cs.str();
     compute_kernel_file.close();
@@ -485,10 +515,12 @@ void Map::generate_writer_device_kernel(
     ws << "\n";
 
     // Save to file.
-    const std::string generated_writer_kernel_path = "tt_metal/programming_examples/personal/current/kernels/generated/writer.cpp";
-    auto writer_kernel_file = std::ofstream(generated_writer_kernel_path);
+    std::string filename = "writer" + std::to_string(get_kernel_index(kernel)) + ".cpp";
+    kernel->generated_writer_kernel_path = GENERATED_KERNELS_PATH / filename;
+    auto writer_kernel_file = std::ofstream(kernel->generated_writer_kernel_path);
     if (!writer_kernel_file.is_open()) {
-        tt::log_error("Failed to open file for writing: {}", generated_writer_kernel_path);
+        tt::log_error("Failed to open file for writing: {}", kernel->generated_writer_kernel_path);
+        exit(1);
     }
     writer_kernel_file << ws.str();
     writer_kernel_file.close();
