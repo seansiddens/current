@@ -1,286 +1,25 @@
-#include <iostream>
 #include "common/core_coord.h"
 #include "logger.hpp"
 #include "tt_metal/host_api.hpp"
 #include "tt_metal/impl/device/device.hpp"
 #include "common/bfloat16.hpp"
 #include "common/work_split.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <random>
-#include <sstream>
 #include <string_view>
 #include <vector>
 #include <chrono>
+#include <iostream>
+
+#include "common.hpp"
+#include "stream.hpp"
 
 using namespace tt;
 
 using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
-
-constexpr uint32_t TILE_WIDTH = 32;
-constexpr uint32_t TILE_HEIGHT = 32;
-constexpr uint32_t TILE_SIZE = TILE_WIDTH * TILE_HEIGHT;
-constexpr uint32_t TILE_SIZE_BYTES = TILE_SIZE * sizeof(bfloat16);
-
-namespace stream {
-    class Kernel {
-      public:
-        Kernel() = default;
-
-        // Add a new input or output port to the kernel
-        void add_input_port(const std::string& name, tt::CB cb) {
-            input_ports[name] = cb;
-        }
-
-        void add_output_port(const std::string& name, tt::CB cb) {
-            output_ports[name] = cb;
-        }
-
-        uint32_t num_input_ports() const {
-            return input_ports.size();
-        }
-
-        uint32_t num_output_ports() const {
-            return output_ports.size();
-        }
-
-        // TODO: For each input port, we need need a CB to move data from NOC to compute.
-        // If the kernel is a generator, each input port will be reading from a DRAM buffer.
-        // If our input/output ports are connected to other kernels, need to determine how to do
-        // the pipelining.
-        std::unordered_map<std::string, tt::CB> input_ports;
-        std::unordered_map<std::string, tt::CB> output_ports;
-    };
-
-    class Map {
-      public:
-        Map(std::vector<Kernel *> kernels) : kernels(kernels) {
-            // Allocate port map.
-            port_map.resize(kernels.size());
-            for (size_t i = 0; i < kernels.size(); i++) {
-                port_map[i].resize(kernels.size());
-            }
-
-            std::cout << "port_map dimensions: " << port_map.size() << " x " << port_map[0].size() << std::endl;
-        }
-
-        void add_connection(Kernel *src, std::string src_out, Kernel *dst, std::string dst_in) {
-            // TODO: Test this.
-            // Get indices of src and dst.
-            size_t src_idx = std::find(kernels.begin(), kernels.end(), src) - kernels.begin();
-            size_t dst_idx = std::find(kernels.begin(), kernels.end(), dst) - kernels.begin();
-            if (src_idx >= kernels.size() || dst_idx >= kernels.size()) {
-                std::cerr << "Failed to add kernel connection!\n";
-                exit(1);
-            }
-            port_map[src_idx][dst_idx] = std::make_pair(src_out, dst_in);
-        }
-
-        void execute() {
-            generate_device_kernels();
-        }
-
-        void generate_device_kernels() {
-            for (int i = 0; i < kernels.size(); i++) {
-                Kernel *kernel = kernels[i];
-                auto input_ports = kernel->input_ports;
-                auto output_ports = kernel->output_ports;
-                auto num_input_ports = kernel->num_input_ports();
-                auto num_output_ports = kernel->num_output_ports();
-                
-                // Generate reader kernel.
-                std::stringstream rs;
-                rs << "#include <cstdint>\n\n";
-                rs << "void kernel_main() {\n";
-
-                // Reader params from kernel args
-                // TODO: If our input ports are not connected to other kernels, we are reading from a DRAM buffer.
-                rs << "    uint32_t src_addr = get_arg_val<uint32_t>(0);\n";
-                rs << "    uint32_t n_tiles = get_arg_val<uint32_t>(1);\n";
-                rs << "    uint32_t start_tile = get_arg_val<uint32_t>(2);\n";
-
-                // Circular buffers.
-                rs << "\n";
-                for (const auto& [name, cb] : input_ports) {
-                    rs << "    constexpr uint32_t " << name << " = " << static_cast<int>(cb) << ";\n";
-                }
-                rs << "\n";
-
-                // Address generator.
-                // TODO: Do we need this? How does this even work?
-                rs << "    InterleavedAddrGenFast<true> a = {\n";
-                rs << "        .bank_base_address = src_addr, \n";
-                rs << "        .page_size = " << TILE_SIZE_BYTES << ", \n";
-                rs << "        .data_format = DataFormat::Float16_b, \n";
-                rs << "    };\n\n";
-
-                // Tile stream loop.
-                rs << "    for(uint32_t i = 0; i < n_tiles; i++) {\n";
-                for (const auto& [name, cb] : input_ports) {
-                    rs << "        cb_reserve_back(" << name << ", 1);\n";
-                    rs << "        uint32_t " << name << "_addr = get_write_ptr(" << name << ");\n";
-                    rs << "        noc_async_read_tile(start_tile + i, a, " << name << "_addr);\n";
-                    rs << "        noc_async_read_barrier();\n";
-                    rs << "        cb_push_back(" << name << ", 1);\n";
-                }
-                rs << "    }\n";
-                rs << "}\n";
-
-                const std::string generated_reader_kernel_path = "tt_metal/programming_examples/personal/stream/kernels/generated/reader.cpp";
-                auto reader_kernel_file = std::ofstream(generated_reader_kernel_path);
-                if (!reader_kernel_file.is_open()) {
-                    tt::log_error("Failed to open file for writing: {}", generated_reader_kernel_path);
-                }
-                reader_kernel_file << rs.str();
-                reader_kernel_file.close();
-
-                // Generate compute kernel.
-                std::stringstream cs;
-                // Includes.
-                cs << "#include \"compute_kernel_api/common.h\"\n";
-                cs << "#include \"compute_kernel_api/tile_move_copy.h\"\n";
-                cs << "#include \"compute_kernel_api/eltwise_binary.h\"\n";
-                cs << "#include \"compute_kernel_api/eltwise_unary/eltwise_unary.h\"\n";
-                cs << "#include \"compute_kernel_api.h\"\n";
-                cs << "#include \"sfpi.h\"\n";
-                cs << "#include \"debug/dprint.h\"\n";
-                cs << "\n";
-
-                // SFPU computation
-                // TODO: Need to somehow parameterize this compute source code generation.
-                cs << "namespace sfpi {\n";
-                cs << "template< int ITERATIONS = 16 >\n";
-                cs << "sfpi_inline void compute() {\n";
-                cs << "    for (int i = 0; i < ITERATIONS; i++) {\n";
-                cs << "        vFloat in = dst_reg[i];\n";
-                cs << "        vFloat a = in + 1.0f;\n";
-                cs << "        vFloat out = a;\n";
-                cs << "        dst_reg[i] = out;\n";
-                cs << "    }\n";
-                cs << "}\n";
-                cs << "}\n";
-                cs << "\n";
-
-                // Main function.
-                cs << "namespace NAMESPACE {\n";
-                cs << "void MAIN {\n";
-
-                // Get kernel args.
-                // TODO: How will this be arbitrarily determined by the runtime?
-                // If each generator stream has a static count, then I assume this can be figured out.
-                cs << "    uint32_t n_tiles = get_arg_val<uint32_t>(0);\n";
-
-                // Circular buffers.
-                // TODO: Do we have a CB for each input port and each output port? 
-                for (const auto& [name, cb] : input_ports) {
-                    cs << "    constexpr uint32_t " << name << " = " << static_cast<int>(cb) << ";\n";
-                }
-                for (const auto& [name, cb] : output_ports) {
-                    cs << "    constexpr uint32_t " << name << " = " << static_cast<int>(cb) << ";\n";
-                }
-                cs << "\n";
-
-                // Initialize SFPU.
-                // TODO: Init state needs to be setup for every input CB.
-                cs << "    init_sfpu(" << input_ports.begin()->first<< ");\n";
-                cs << "\n";
-
-                // Tile stream loop
-                cs << "    for(uint32_t i = 0; i < n_tiles; i++) {\n";
-                cs << "        cb_wait_front(cb_in0, 1);\n";
-                cs << "        copy_tile(cb_in0, 0, 0);\n";
-                cs << "        tile_regs_acquire();\n";
-                cs << "        MATH((sfpi::compute()));\n";
-                cs << "        tile_regs_commit();\n";
-                cs << "        cb_pop_front(cb_in0, 1);\n";
-                cs << "        tile_regs_wait();\n";
-                cs << "        cb_reserve_back(cb_out0, 1);\n";
-                cs << "        pack_tile(0, cb_out0);\n";
-                cs << "        cb_push_back(cb_out0, 1);\n";
-                cs << "        tile_regs_release();\n";
-                // End tile stream loop.
-                cs << "    }\n";
-
-                // End main.
-                cs << "}\n";
-                cs << "}\n";
-                cs << "\n";
-
-                // Save to file.
-                const std::string generated_compute_kernel_path = "tt_metal/programming_examples/personal/stream/kernels/generated/compute.cpp";
-                auto compute_kernel_file = std::ofstream(generated_compute_kernel_path);
-                if (!compute_kernel_file.is_open()) {
-                    tt::log_error("Failed to open file for writing: {}", generated_compute_kernel_path);
-                }
-                compute_kernel_file << cs.str();
-                compute_kernel_file.close();
-
-                std::stringstream ws;
-                // Includes.
-                ws << "#include <cstdint>\n";
-                ws << "\n";
-
-                // Main 
-                ws << "void kernel_main() {\n";
-
-                // Get kernel runtime args.
-                ws << "    uint32_t dst_addr = get_arg_val<uint32_t>(0);\n";
-                ws << "    uint32_t n_tiles = get_arg_val<uint32_t>(1);\n";
-                ws << "    uint32_t start_tile = get_arg_val<uint32_t>(2);\n";
-                ws << "\n";
-
-                // Circular buffers.
-                for (const auto& [name, cb] : output_ports) {
-                    ws << "    constexpr uint32_t " << name << " = " << static_cast<int>(cb) << ";\n";
-                }
-                ws << "\n";
-
-                // Address generator.
-                // TODO: Do we need this? How does this even work?
-                ws << "    InterleavedAddrGenFast<true> c = {\n";
-                ws << "        .bank_base_address = dst_addr, \n";
-                ws << "        .page_size = " << TILE_SIZE_BYTES << ", \n";
-                ws << "        .data_format = DataFormat::Float16_b, \n";
-                ws << "    };\n\n";
-
-                // Tile stream loop.
-                ws << "    for(uint32_t i = 0; i < n_tiles; i++) {\n";
-                ws << "        cb_wait_front(cb_out0, 1);\n";
-                ws << "        uint32_t cb_out0_addr = get_read_ptr(cb_out0);\n";
-                ws << "        noc_async_write_tile(start_tile + i, c, cb_out0_addr);\n";
-                ws << "        noc_async_write_barrier();\n";
-                // TODO: Potentially slower than just using noc_async_write_flushed().
-                // Might not even have to use until the last tile is written.
-                ws << "        cb_pop_front(cb_out0, 1);\n";
-
-                // End tile stream loop
-                ws << "    }\n";
-
-                //End Main
-                ws << "}\n";
-                ws << "\n";
-
-                // Save to file.
-                const std::string generated_writer_kernel_path = "tt_metal/programming_examples/personal/stream/kernels/generated/writer.cpp";
-                auto writer_kernel_file = std::ofstream(generated_writer_kernel_path);
-                if (!writer_kernel_file.is_open()) {
-                    tt::log_error("Failed to open file for writing: {}", generated_writer_kernel_path);
-                }
-                writer_kernel_file << ws.str();
-                writer_kernel_file.close();
-            }
-        }
-
-      private:
-        std::vector<Kernel *> kernels;
-        // Adjaceny matrix representing our kernel flow graph.
-        // Entry at [i][j] represents that we have an outgoing stream from kernel[i] to kernel[j].
-        // The entry stores a pair <out_port, in_port> representing a connection from kernel[i]'s out_port to kernel[j]'s in_port.
-        // TODO: Right now we are only storing a single pair for each edge. This means we can only have one connection between any two kernels.
-        std::vector<std::vector<std::pair<std::string, std::string>>> port_map;
-    };
-}
 
 std::shared_ptr<Buffer> MakeBuffer(Device *device, uint32_t size, uint32_t page_size, bool sram) {
     InterleavedBufferConfig config{
@@ -405,6 +144,7 @@ int main(int argc, char **argv) {
     auto output_buffer = MakeBufferBFP16(device, n_tiles, false);
     std::mt19937 rng(seed);
     std::vector<uint32_t> generator_data = create_constant_vector_of_bfloat16(TILE_SIZE_BYTES * n_tiles, 0.0f);
+    std::vector<uint32_t> output_data = create_constant_vector_of_bfloat16(TILE_SIZE_BYTES * n_tiles, 0.0f);
     EnqueueWriteBuffer(cq, generator_buffer, generator_data, true);
     tt::log_info("Wrote generator buffer to DRAM");
 
@@ -416,11 +156,17 @@ int main(int argc, char **argv) {
 
     // Kernel generation.
     stream::Kernel reader_kernel;
-    reader_kernel.add_input_port("cb_in0", tt::CB::c_in0);
-    reader_kernel.add_output_port("cb_out0", tt::CB::c_out0);
+    // TODO: Automatically assign CBs to kernels? Also have a typed port? 
+    reader_kernel.add_input_port("in0", tt::CB::c_in0);
+    reader_kernel.add_output_port("out0", tt::CB::c_out0);
+    stream::Stream source(generator_data, count, sizeof(bfloat16));
+    stream::Stream sink(output_data, count, sizeof(bfloat16));
 
-    stream::Map map({&reader_kernel});
-    map.generate_device_kernels();
+    stream::Map map({&reader_kernel}, {&source, &sink});
+    map.add_connection(&source, &reader_kernel, "in0");
+    map.add_connection(&reader_kernel, "out0", &sink);
+
+    return 0;
 
     auto reader = CreateKernel(
         program,
@@ -484,7 +230,6 @@ int main(int argc, char **argv) {
     double bandwidth_mbps = (total_bytes) / (duration.count() * 1e-6) / 1e6;
     
     // Read the output buffer.
-    std::vector<uint32_t> output_data;
     EnqueueReadBuffer(cq, output_buffer, output_data, true);
 
     // Print output data.
