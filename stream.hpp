@@ -8,19 +8,24 @@
 #include "tt_metal/host_api.hpp"
 #include "common/bfloat16.hpp"
 
+#include "common.hpp"
+
 using namespace tt;
 
 namespace stream {
 
-using PortName = std::string;
-
 // Wrapper around a DRAM buffer. Used as source and dest of stream data for kernels.
 class Stream {
   public: 
-    Stream(std::vector<uint32_t> inital_data, size_t num_elements, size_t element_size) {
+    Stream(std::vector<uint32_t> inital_data, size_t num_elements, tt::DataFormat data_format) {
         n_elements = num_elements;
         host_data = inital_data;
-        this->element_size = element_size;
+        this->element_size = tt::datum_size(data_format);
+        this->data_format = data_format;
+        this->n_tiles = std::ceil(n_elements / TILE_SIZE);
+        // std::cout << "Stream n_tiles: " << n_tiles << "\n";
+        // std::cout << "Stream n_elements: " << n_elements << "\n";
+        // std::cout << "Stream element_size: " << element_size << "\n";
     }
 
   private:
@@ -34,25 +39,33 @@ class Stream {
     std::shared_ptr<tt_metal::Buffer> device_buffer;
     uint32_t device_buffer_address;
     tt_metal::CoreCoord device_buffer_noc_coordinates;
-    size_t n_elements;
-    size_t element_size;
+    size_t n_elements;   // Number of elements/tokens this stream will produce.
+    size_t element_size; // Size (in bytes) of each element
+    uint32_t n_tiles;    // Total # of 32x32 tiles this stream will produce.
+    tt::DataFormat data_format;
 };
 
 class Kernel {
   public: 
     Kernel() = default;
 
-    void add_input_port(const std::string& name, tt::CB cb);
-    void add_output_port(const std::string& name, tt::CB cb);
+    void add_input_port(const std::string& name, tt::DataFormat data_format);
+    void add_output_port(const std::string& name, tt::DataFormat data_format);
     uint32_t num_input_ports() const;
     uint32_t num_output_ports() const;
+
+    struct Port {
+        std::string name;
+        tt::DataFormat data_format;
+        tt::CB cb; // TODO: Do we want ports to have ownership of CBs?
+    };
 
     // TODO: For each input port, we need need a CB to move data from NOC to compute.
     // If the kernel is a generator, each input port will be reading from a DRAM buffer.
     // If our input/output ports are connected to other kernels, need to determine how to do
     // the pipelining.
-    std::unordered_map<std::string, tt::CB> input_ports;
-    std::unordered_map<std::string, tt::CB> output_ports;
+    std::vector<Port> input_ports;
+    std::vector<Port> output_ports;
 };
 
 class Map {
@@ -85,13 +98,13 @@ class Map {
 
     // Represents a connection endpoint (either kernel or stream)
     struct Endpoint {
-        enum class Type { Kernel, Stream };
-        Type type;
+        enum class EndpointType { Kernel, Stream };
+        EndpointType endpoint_type;
         size_t index;      // Index into either kernels or streams vector
         std::string port;  // Port name (only valid for kernels)
 
-        bool is_kernel() const { return type == Type::Kernel; }
-        bool is_stream() const { return type == Type::Stream; }
+        bool is_kernel() const { return endpoint_type == EndpointType::Kernel; }
+        bool is_stream() const { return endpoint_type == EndpointType::Stream; }
     };
 
     // Represents a directed connection between endpoints
@@ -110,6 +123,9 @@ class Map {
     // // Entry <port_name> at [i][j] represents a connection from stream i to kernel j's input port port_name.
     // std::vector<std::vector<std::string>> stream_port_map;
 
+    std::vector<Connection> get_incoming_connections(Kernel *kernel);
+    std::vector<Connection> get_outgoing_connections(Kernel *kernel);
+
     size_t get_kernel_index(Kernel *kernel) {
         return std::find(kernels.begin(), kernels.end(), kernel) - kernels.begin();
     }
@@ -122,9 +138,9 @@ class Map {
         connections.push_back({src, dst});
     }
 
-    void generate_reader_device_kernel(Kernel *kernel);
-    void generate_writer_device_kernel(Kernel *kernel);
-    void generate_compute_device_kernel(Kernel *kernel);
+    void generate_reader_device_kernel(Kernel *kernel, std::vector<Kernel::Port> input_ports, std::vector<Connection> incoming_connections);
+    void generate_compute_device_kernel(Kernel *kernel, std::vector<Kernel::Port> input_ports, std::vector<Kernel::Port> output_ports);
+    void generate_writer_device_kernel(Kernel *kernel, std::vector<Kernel::Port> output_ports, std::vector<Connection> outgoing_connections);
     bool has_incoming_connection(Kernel *kernel);
 };
 

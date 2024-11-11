@@ -143,8 +143,8 @@ int main(int argc, char **argv) {
     auto generator_buffer = MakeBufferBFP16(device, n_tiles, false);
     auto output_buffer = MakeBufferBFP16(device, n_tiles, false);
     std::mt19937 rng(seed);
-    std::vector<uint32_t> generator_data = create_constant_vector_of_bfloat16(TILE_SIZE_BYTES * n_tiles, 0.0f);
-    std::vector<uint32_t> output_data = create_constant_vector_of_bfloat16(TILE_SIZE_BYTES * n_tiles, 0.0f);
+    std::vector<uint32_t> generator_data = create_constant_vector_of_bfloat16(TILE_SIZE * n_tiles, 0.0f);
+    std::vector<uint32_t> output_data = create_constant_vector_of_bfloat16(TILE_SIZE * n_tiles, 0.0f);
     EnqueueWriteBuffer(cq, generator_buffer, generator_data, true);
     tt::log_info("Wrote generator buffer to DRAM");
 
@@ -157,15 +157,16 @@ int main(int argc, char **argv) {
     // Kernel generation.
     stream::Kernel reader_kernel0;
     // TODO: Automatically assign CBs to kernels? Also have a typed port? 
-    reader_kernel0.add_input_port("in0", tt::CB::c_in0);
-    reader_kernel0.add_output_port("out0", tt::CB::c_out0);
-    stream::Stream source(generator_data, count, sizeof(bfloat16));
-    stream::Stream sink(output_data, count, sizeof(bfloat16));
+    reader_kernel0.add_input_port("in0", tt::DataFormat::Float16_b);
+    reader_kernel0.add_output_port("out0", tt::DataFormat::Float16_b);
+    stream::Stream source(generator_data, count, tt::DataFormat::Float16_b);
+    stream::Stream sink(output_data, count, tt::DataFormat::Float16_b);
 
     stream::Map map({&reader_kernel0}, {&source, &sink});
     map.add_connection(&source, &reader_kernel0, "in0");
     map.add_connection(&reader_kernel0, "out0", &sink);
     map.export_dot("stream_graph.dot");
+    map.execute();
 
     return 0;
 
