@@ -54,6 +54,24 @@ class Kernel {
     uint32_t num_input_ports() const;
     uint32_t num_output_ports() const;
 
+    uint32_t get_input_port_index(std::string port_name) const {
+        for (size_t i = 0; i < input_ports.size(); i++) {
+            if (input_ports[i].name == port_name) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    uint32_t get_output_port_index(std::string port_name) const {
+        for (size_t i = 0; i < output_ports.size(); i++) {
+            if (output_ports[i].name == port_name) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     struct Port {
         std::string name;
         tt::DataFormat data_format;
