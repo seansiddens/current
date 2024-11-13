@@ -6,8 +6,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/bfloat16.hpp"
 #include "current/common.hpp"
 #include "impl/buffers/buffer.hpp"
+#include "impl/buffers/circular_buffer_types.hpp"
 #include "work_split.hpp"
 
 namespace stream {
@@ -105,6 +107,7 @@ void Map::execute() {
     // 4. Generate device kernels.
     generate_device_kernels();
 
+    // Vector of cores we have availible to assign to kernels.
     std::vector<CoreCoord> cores;
     for (const CoreRange& range : runtime.core_set) {
         for (const CoreCoord& core : range) {
@@ -114,20 +117,136 @@ void Map::execute() {
 
     for (size_t i = 0; i < kernels.size(); i++) {
         auto kernel = kernels[i];
-
         // Each kernel gets mapped to a single core. 
         // We just assign to the next available core.
         // TODO: Look into core placement strategies (RaftLib thesis)
+        // possibly doing automatic parallelization of kernels.
+        // NOTE: This also requires that we need as many cores as kernels.
         kernel->core_spec = cores[i];
 
+        // Create circular buffers for each input and output port.
+        for (size_t i = 0; i < kernel->num_input_ports(); i++) {
+            // Each port is typed with a specific data format. 
+            auto cb_index = i + IN_CB_START;
+            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(kernel->input_ports[i].data_format);
+            auto input_port = kernel->input_ports[i];
+            tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
+                TILES_PER_CB * tile_size_bytes,
+                {{cb_index, input_port.data_format}}
+            ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
+            kernel->input_ports[i].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
+        }
+
+        for (size_t i = 0; i < kernel->num_output_ports(); i++) {
+            auto cb_index = i + OUT_CB_START;
+            auto output_port = kernel->output_ports[i];
+            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(output_port.data_format);
+            tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
+                TILES_PER_CB * tile_size_bytes,
+                {{cb_index, output_port.data_format}}
+            ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
+            kernel->output_ports[i].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
+        }
+
         // Create device kernels.
-        // auto reader = tt_metal::CreateKernel(
-        //     runtime.program,
-        //     GENERATED_KERNELS_PATH / "reader.cpp",
-        // );
+        auto reader = tt_metal::CreateKernel(
+            runtime.program,
+            kernel->generated_reader_kernel_path,
+            kernel->core_spec,
+            // TODO: Can also do compile-time args here? I think this might be useful.
+            DataMovementConfig {
+                .processor = DataMovementProcessor::RISCV_0, 
+                .noc = NOC::RISCV_0_default,
+                .compile_args = {},
+                .defines = {}
+            } // TODO: What to do for this?
+        );
+        kernel->reader_kernel = reader;
+
+        auto compute = tt_metal::CreateKernel(
+            runtime.program,
+            kernel->generated_compute_kernel_path,
+            kernel->core_spec,
+            ComputeConfig{
+                // TODO: Also need to figure out what the heck to do for this.
+                .dst_full_sync_en = true, // Don't know what this is lol
+                .math_approx_mode = false,
+                .compile_args = {},
+                .defines = {}
+            }
+        );
+        kernel->compute_kernel = compute;
+
+        auto writer = tt_metal::CreateKernel(
+            runtime.program,
+            kernel->generated_writer_kernel_path,
+            kernel->core_spec,
+            DataMovementConfig {
+                .processor = DataMovementProcessor::RISCV_1,
+                .noc = NOC::RISCV_1_default,
+                .compile_args = {},
+                .defines = {}
+            }
+        );
+        kernel->writer_kernel = writer;
+
+        // Set runtime args.
+        auto incoming_connections = get_incoming_connections(kernel);
+        std::cout << "Incoming connections: " << incoming_connections.size() << "\n";
+        auto outgoing_connections = get_outgoing_connections(kernel);
+        std::cout << "Outgoing connections: " << outgoing_connections.size() << "\n";
+        std::vector<uint32_t> reader_args;
+        std::vector<uint32_t> compute_args;
+        for (const auto& connection : incoming_connections) {
+            if (connection.source.is_stream()) {
+                // For every incoming stream connection, we need to know how many tiles we expect to read and what the DRAM address is.
+                auto stream = streams[connection.source.index];
+                reader_args.push_back(stream->n_tiles);
+                reader_args.push_back(stream->device_buffer_address);
+                compute_args.push_back(stream->n_tiles); // Compute also needs to know how many tiles to read in.
+            } else {
+                // TODO: Handle incoming kernel connections.
+                std::cerr << "Unsupported connection type!\n";
+                exit(1);
+            }
+        }
+        SetRuntimeArgs(runtime.program, kernel->reader_kernel, kernel->core_spec, reader_args);
+        SetRuntimeArgs(runtime.program, kernel->compute_kernel, kernel->core_spec, compute_args);
+
+        std::vector<uint32_t> writer_args;
+        for (const auto& connection : outgoing_connections) {
+            if (connection.dest.is_stream()) {
+                // TODO: Here we are explicitly setting the # of tiles we expect to write to be the same as the capacity of the stream.
+                // This can get a bit tricky if the compute does any sort of reduction and the user does not correctly set the capacity.
+                // I think if reduction kernels get implemented then we need a way of automatically determining the # of tiles to write at each stage of the program.
+                auto stream = streams[connection.dest.index];
+                writer_args.push_back(stream->n_tiles);
+                writer_args.push_back(stream->device_buffer_address);
+            } else {
+                // TODO: Handle outgoing kernel connections.
+                std::cerr << "Unsupported connection type!\n";
+                exit(1);
+            }
+        }
+        SetRuntimeArgs(runtime.program, kernel->writer_kernel, kernel->core_spec, writer_args);
     }
 
+    tt_metal::EnqueueProgram(runtime.device->command_queue(), runtime.program, true);
+    tt_metal::Finish(runtime.device->command_queue());
+    std::cout << "Program execution completed!\n";
 
+    // Read output from sink buffer.
+    // TODO: Right now we just hard-code this to the last stream, but need to figure out what streams we want to read from. 
+    // Could copy ALL streams's data back to their host buffer, then let the user decide which ones to read from via a Stream method.
+    tt_metal::EnqueueReadBuffer(runtime.device->command_queue(), streams[1]->device_buffer, streams[1]->host_data, true);
+
+    std::vector<bfloat16> output_data = unpack_uint32_vec_into_bfloat16_vec(streams[1]->host_data);
+    for (uint32_t i = 0; i < output_data.size(); i++) {
+        std::cout << output_data[i].to_float() << " ";
+    }
+    std::cout << std::endl;
+
+    tt_metal::CloseDevice(runtime.device);
 }
 
 bool Map::has_incoming_connection(Kernel *kernel) {
@@ -168,7 +287,7 @@ std::vector<Map::Connection> Map::get_outgoing_connections(Kernel *kernel) {
     // Find all connections that have our kernel as the source
     std::vector<Connection> outgoing_connections;
     for (const Connection& connection : connections) {
-        if (connection.source.index == kernel_idx) {
+        if (connection.source.index == kernel_idx && connection.source.endpoint_type == Endpoint::EndpointType::Kernel) {
             outgoing_connections.push_back(connection);
         }
     }
@@ -221,6 +340,8 @@ void Map::generate_reader_device_kernel(
             rs << "    };\n\n";
         } else {
             // TODO: Handle incoming kernel connections.
+            std::cerr << "Unsupported connection type!\n";
+            exit(1);
         }
     }
 
@@ -451,6 +572,9 @@ void Map::generate_writer_device_kernel(
     for (size_t i = 0; i < outgoing_connections.size(); i++) {
         auto connection = outgoing_connections[i];
         if (connection.dest.is_stream()) {
+            // TODO: Here we are using the capacity of the stream we are writing to in order to determine how many tiles we need to write.
+            // The issue with this is that if compute does any sort of reduction, then the capacity of the stream will be incorrect (unless it's explicitly set to match).
+            // Need to think about how to do this automatically (e.g analyzing the # of tiles we stream in and out for each tile).
             auto stream = streams[connection.dest.index];
             // Kernel -> Stream, get the output port index.
             auto port_index = kernel->get_output_port_index(connection.source.port);

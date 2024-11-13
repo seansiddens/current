@@ -77,7 +77,7 @@ class Kernel {
     struct Port {
         std::string name;
         tt::DataFormat data_format;
-        tt::CB cb; // TODO: Do we want ports to have ownership of CBs?
+        tt_metal::CBHandle cb; // TODO: Do we want ports to have ownership of CBs?
     };
 
     // TODO: For each input port, we need need a CB to move data from NOC to compute.
@@ -163,6 +163,8 @@ class Map {
 
     void add_connection(const Endpoint& src, const Endpoint& dst) {
         connections.push_back({src, dst});
+        std::cout << "Added connection: " << src.index << " -> " << dst.index << "\n";
+        std::cout << "Total connections: " << connections.size() << "\n";
     }
 
     void generate_reader_device_kernel(Kernel *kernel, std::vector<Kernel::Port> input_ports, std::vector<Connection> incoming_connections);
