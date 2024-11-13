@@ -93,17 +93,6 @@ void Map::execute() {
         stream->device_buffer_noc_coordinates = stream->device_buffer->noc_coordinates();
     }
 
-    // TODO: CBs are pinned to specific cores, need to figure out kernel placement before this.
-    // // For every kernel in our program, we will have a CB for each input and output port.
-    // for (size_t i = 0; i < kernels.size(); i++) {
-    //     auto kernel = kernels[i];
-    //     for (const auto& input_port : kernel->input_ports) {
-    //         tt::CircularBufferConfig cb_config = CircularBufferConfig(
-    //             .size = TILES_PER_CB,
-    //         )
-    //     }
-    // }
-
     // 4. Generate device kernels.
     generate_device_kernels();
 
@@ -238,9 +227,10 @@ void Map::execute() {
     // Read output from sink buffer.
     // TODO: Right now we just hard-code this to the last stream, but need to figure out what streams we want to read from. 
     // Could copy ALL streams's data back to their host buffer, then let the user decide which ones to read from via a Stream method.
-    tt_metal::EnqueueReadBuffer(runtime.device->command_queue(), streams[1]->device_buffer, streams[1]->host_data, true);
+    std::vector<uint32_t> out;
+    tt_metal::EnqueueReadBuffer(runtime.device->command_queue(), streams[1]->device_buffer, out, true);
 
-    std::vector<bfloat16> output_data = unpack_uint32_vec_into_bfloat16_vec(streams[1]->host_data);
+    std::vector<bfloat16> output_data = unpack_uint32_vec_into_bfloat16_vec(out);
     for (uint32_t i = 0; i < output_data.size(); i++) {
         std::cout << output_data[i].to_float() << " ";
     }
@@ -502,7 +492,7 @@ void Map::generate_compute_device_kernel(
     }
     cs << "\n";
     cs << "        tile_regs_acquire();\n";
-    cs << "        MATH((sfpi::compute()));\n";
+    cs << "        MATH((sfpi::compute<16>()));\n";
     cs << "        tile_regs_commit();\n";
     cs << "\n";
     // Computation finished, pop tiles from input CBs

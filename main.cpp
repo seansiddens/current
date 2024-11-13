@@ -143,8 +143,8 @@ int main(int argc, char **argv) {
     auto generator_buffer = MakeBufferBFP16(device, n_tiles, false);
     auto output_buffer = MakeBufferBFP16(device, n_tiles, false);
     std::mt19937 rng(seed);
-    std::vector<uint32_t> generator_data = create_constant_vector_of_bfloat16(TILE_SIZE * n_tiles, 0.0f);
-    std::vector<uint32_t> output_data = create_constant_vector_of_bfloat16(TILE_SIZE * n_tiles, 0.0f);
+    std::vector<uint32_t> generator_data = create_constant_vector_of_bfloat16(TILE_SIZE * n_tiles * 2, 0.0f);
+    std::vector<uint32_t> output_data = create_constant_vector_of_bfloat16(TILE_SIZE * n_tiles * 2, 0.0f);
     EnqueueWriteBuffer(cq, generator_buffer, generator_data, true);
     tt::log_info("Wrote generator buffer to DRAM");
 
@@ -170,88 +170,88 @@ int main(int argc, char **argv) {
 
     return 0;
 
-    // auto reader = CreateKernel(
-    //     program,
-    //     "tt_metal/programming_examples/personal/stream/kernels/generated/reader.cpp",
-    //     core_set,
-    //     DataMovementConfig {.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default}
-    // );
-    // auto writer = CreateKernel(
-    //     program,
-    //     "tt_metal/programming_examples/personal/stream/kernels/generated/writer.cpp",
-    //     core_set,
-    //     DataMovementConfig {.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default}
-    // );
-    // auto compute = CreateKernel(
-    //     program,
-    //     "tt_metal/programming_examples/personal/stream/kernels/generated/compute.cpp",
-    //     core_set,
-    //     ComputeConfig{
-    //         .dst_full_sync_en = true, // TODO: What tf is this?
-    //         .math_approx_mode = false,
-    //         .compile_args = {},
-    //         .defines = {}
-    //     }
-    // );
+    auto reader = CreateKernel(
+        program,
+        "tt_metal/programming_examples/personal/current/kernels/generated/reader0.cpp",
+        core_set,
+        DataMovementConfig {.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default}
+    );
+    auto writer = CreateKernel(
+        program,
+        "tt_metal/programming_examples/personal/current/kernels/generated/writer0.cpp",
+        core_set,
+        DataMovementConfig {.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default}
+    );
+    auto compute = CreateKernel(
+        program,
+        "tt_metal/programming_examples/personal/current/kernels/generated/compute0.cpp",
+        core_set,
+        ComputeConfig{
+            .dst_full_sync_en = true, // TODO: What tf is this?
+            .math_approx_mode = false,
+            .compile_args = {},
+            .defines = {}
+        }
+    );
 
-    // // Set runtime args for each core.
-    // for (uint32_t i = 0, num_tiles_written = 0; i < num_cores; i++) {
-    //     CoreCoord core = {i / num_cores_y, i % num_cores_y};
+    // Set runtime args for each core.
+    for (uint32_t i = 0, num_tiles_written = 0; i < num_cores; i++) {
+        CoreCoord core = {i / num_cores_y, i % num_cores_y};
 
-    //     // Set the runtime arguments for the kernels. This also registers
-    //     // the kernels with the program.
-    //     SetRuntimeArgs(program, reader, core, {
-    //         generator_buffer->address(),
-    //         tiles_per_core_vec[i],
-    //         num_tiles_written,
-    //     });
-    //     SetRuntimeArgs(program, writer, core, {
-    //         output_buffer->address(),
-    //         tiles_per_core_vec[i],
-    //         num_tiles_written
-    //     });
-    //     SetRuntimeArgs(program, compute, core, {
-    //         tiles_per_core_vec[i],
-    //     });
+        // Set the runtime arguments for the kernels. This also registers
+        // the kernels with the program.
+        SetRuntimeArgs(program, reader, core, {
+            generator_buffer->address(),
+            tiles_per_core_vec[i],
+            num_tiles_written,
+        });
+        SetRuntimeArgs(program, writer, core, {
+            output_buffer->address(),
+            tiles_per_core_vec[i],
+            num_tiles_written
+        });
+        SetRuntimeArgs(program, compute, core, {
+            tiles_per_core_vec[i],
+        });
 
-    //     num_tiles_written += tiles_per_core_vec[i];
-    // }
+        num_tiles_written += tiles_per_core_vec[i];
+    }
 
 
-    // auto start_time = std::chrono::high_resolution_clock::now();
-    // EnqueueProgram(cq, program, true);
-    // auto end_time = std::chrono::high_resolution_clock::now();
-    // Finish(cq);
+    auto start_time = std::chrono::high_resolution_clock::now();
+    EnqueueProgram(cq, program, true);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    Finish(cq);
 
-    // // Calculate metrics
-    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-    // double latency_ms = duration.count() / 1000.0;  // Convert to milliseconds
+    // Calculate metrics
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    double latency_ms = duration.count() / 1000.0;  // Convert to milliseconds
     
-    // // Calculate data size and bandwidth
-    // size_t total_bytes = n_tiles * TILE_WIDTH * TILE_HEIGHT * sizeof(bfloat16);
-    // double bandwidth_mbps = (total_bytes) / (duration.count() * 1e-6) / 1e6;
+    // Calculate data size and bandwidth
+    size_t total_bytes = n_tiles * TILE_WIDTH * TILE_HEIGHT * sizeof(bfloat16);
+    double bandwidth_mbps = (total_bytes) / (duration.count() * 1e-6) / 1e6;
     
-    // // Read the output buffer.
-    // EnqueueReadBuffer(cq, output_buffer, output_data, true);
+    // Read the output buffer.
+    EnqueueReadBuffer(cq, output_buffer, output_data, true);
 
-    // // Print output data.
-    // std::vector<bfloat16> output = unpack_uint32_vec_into_bfloat16_vec(output_data);
-    // for (uint32_t i = 0; i < output.size(); i++) {
-    //     std::cout << output[i].to_float() << " ";
-    // }
-    // std::cout << std::endl;
+    // Print output data.
+    std::vector<bfloat16> output = unpack_uint32_vec_into_bfloat16_vec(output_data);
+    for (uint32_t i = 0; i < output.size(); i++) {
+        std::cout << output[i].to_float() << " ";
+    }
+    std::cout << std::endl;
 
-    // // Print performance metrics
-    // std::cout << "\nPerformance Metrics:" << std::endl;
-    // std::cout << "Number of tiles: " << n_tiles << std::endl;
-    // std::cout << "Total # of cores: " << num_cores << std::endl;
-    // std::cout << "Total Execution Time: " << latency_ms << " ms" << std::endl;
-    // std::cout << "Latency per tile: " << latency_ms / n_tiles << " ms/tile" << std::endl;
-    // std::cout << "Total Bandwidth: " << bandwidth_mbps << " MB/s" << std::endl;
-    // std::cout << "Bandwidth per tile: " << bandwidth_mbps / n_tiles << " MB/s/tile" << std::endl;
-    // std::cout << "Data processed: " << total_bytes / 1024.0 / 1024.0 << " MB" << std::endl;
+    // Print performance metrics
+    std::cout << "\nPerformance Metrics:" << std::endl;
+    std::cout << "Number of tiles: " << n_tiles << std::endl;
+    std::cout << "Total # of cores: " << num_cores << std::endl;
+    std::cout << "Total Execution Time: " << latency_ms << " ms" << std::endl;
+    std::cout << "Latency per tile: " << latency_ms / n_tiles << " ms/tile" << std::endl;
+    std::cout << "Total Bandwidth: " << bandwidth_mbps << " MB/s" << std::endl;
+    std::cout << "Bandwidth per tile: " << bandwidth_mbps / n_tiles << " MB/s/tile" << std::endl;
+    std::cout << "Data processed: " << total_bytes / 1024.0 / 1024.0 << " MB" << std::endl;
 
-    // // Finally, we close the device.
-    // CloseDevice(device);
+    // Finally, we close the device.
+    CloseDevice(device);
     return 0;
 }

@@ -20,6 +20,7 @@ using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
 class Stream {
   public: 
     Stream(std::vector<uint32_t> inital_data, size_t num_elements, tt::DataFormat data_format) {
+        assert(inital_data.size() * 4 == num_elements * tt::datum_size(data_format));
         n_elements = num_elements;
         host_data = inital_data;
         this->element_size = tt::datum_size(data_format);
