@@ -12,7 +12,7 @@
 #include "impl/buffers/circular_buffer_types.hpp"
 #include "work_split.hpp"
 
-namespace stream {
+namespace current {
 
 
 // Add a new input or output port to the kernel
@@ -37,20 +37,29 @@ Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams) : kernels
 // TODO: Validate that port connections are valid (check that types are the same.)
 void Map::add_connection(Kernel *src, std::string src_out, Kernel *dst, std::string dst_in) {
     // TODO: Add error handling.
-    Endpoint src_endpoint = {Endpoint::EndpointType::Kernel, get_kernel_index(src), src_out};
-    Endpoint dst_endpoint = {Endpoint::EndpointType::Kernel, get_kernel_index(dst), dst_in};
+    auto src_kernel_idx = get_kernel_index(src);
+    auto dst_kernel_idx = get_kernel_index(dst);
+    Endpoint src_endpoint = {Endpoint::EndpointType::Kernel, src_kernel_idx, src_out};
+    Endpoint dst_endpoint = {Endpoint::EndpointType::Kernel, dst_kernel_idx, dst_in};
+    tt::log_info("[CURRENT] Adding connection from kernel {} to kernel {}", src_kernel_idx, dst_kernel_idx);
     add_connection(src_endpoint, dst_endpoint);
 }
 
 void Map::add_connection(Stream *src, Kernel *dst, std::string dst_in) {
-    Endpoint src_endpoint = {Endpoint::EndpointType::Stream, get_stream_index(src), ""};
-    Endpoint dst_endpoint = {Endpoint::EndpointType::Kernel, get_kernel_index(dst), dst_in};
+    auto src_stream_idx = get_stream_index(src);
+    auto dst_kernel_idx = get_kernel_index(dst);
+    Endpoint src_endpoint = {Endpoint::EndpointType::Stream, src_stream_idx, ""};
+    Endpoint dst_endpoint = {Endpoint::EndpointType::Kernel, dst_kernel_idx, dst_in};
+    tt::log_info("[CURRENT] Adding connection from stream {} to kernel {}", src_stream_idx, dst_kernel_idx);
     add_connection(src_endpoint, dst_endpoint);
 }
 
 void Map::add_connection(Kernel *src, std::string src_out, Stream *dst) {
-    Endpoint src_endpoint = {Endpoint::EndpointType::Kernel, get_kernel_index(src), src_out};
-    Endpoint dst_endpoint = {Endpoint::EndpointType::Stream, get_stream_index(dst), ""};
+    auto src_kernel_idx = get_kernel_index(src);
+    auto dst_stream_idx = get_stream_index(dst);
+    Endpoint src_endpoint = {Endpoint::EndpointType::Kernel, src_kernel_idx, src_out};
+    Endpoint dst_endpoint = {Endpoint::EndpointType::Stream, dst_stream_idx, ""};
+    tt::log_info("[CURRENT] Adding connection from kernel {} to stream {}", src_kernel_idx, dst_stream_idx);
     // TODO: Need to do checks whether these are valid port names and that the ports have not already been connected.
     add_connection(src_endpoint, dst_endpoint);
 }
@@ -181,9 +190,7 @@ void Map::execute() {
 
         // Set runtime args.
         auto incoming_connections = get_incoming_connections(kernel);
-        std::cout << "Incoming connections: " << incoming_connections.size() << "\n";
         auto outgoing_connections = get_outgoing_connections(kernel);
-        std::cout << "Outgoing connections: " << outgoing_connections.size() << "\n";
         std::vector<uint32_t> reader_args;
         std::vector<uint32_t> compute_args;
         for (const auto& connection : incoming_connections) {
@@ -195,7 +202,7 @@ void Map::execute() {
                 compute_args.push_back(stream->n_tiles); // Compute also needs to know how many tiles to read in.
             } else {
                 // TODO: Handle incoming kernel connections.
-                std::cerr << "Unsupported connection type!\n";
+                tt::log_error("[CURRENT] Unsupported connection type!");
                 exit(1);
             }
         }
@@ -213,7 +220,7 @@ void Map::execute() {
                 writer_args.push_back(stream->device_buffer_address);
             } else {
                 // TODO: Handle outgoing kernel connections.
-                std::cerr << "Unsupported connection type!\n";
+                tt::log_error("[CURRENT] Unsupported connection type!");
                 exit(1);
             }
         }
@@ -222,7 +229,7 @@ void Map::execute() {
 
     tt_metal::EnqueueProgram(runtime.device->command_queue(), runtime.program, true);
     tt_metal::Finish(runtime.device->command_queue());
-    std::cout << "Program execution completed!\n";
+    tt::log_info("[CURRENT] Program execution completed!");
 
     // Read output from sink buffer.
     // TODO: Right now we just hard-code this to the last stream, but need to figure out what streams we want to read from. 
@@ -384,7 +391,6 @@ void Map::generate_reader_device_kernel(
     }
     reader_kernel_file << rs.str();
     reader_kernel_file.close();
-    std::cout << "Generated reader kernel!\n";
 }
 
 void Map::generate_compute_device_kernel(
@@ -699,4 +705,4 @@ void Map::export_dot(const std::string& filename) const {
     dot_file.close();
 }
 
-} // End namespace stream
+} // End namespace current

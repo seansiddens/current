@@ -10,7 +10,7 @@
 
 using namespace tt;
 
-namespace stream {
+namespace current {
 
 const std::filesystem::path GENERATED_KERNELS_PATH = "tt_metal/programming_examples/personal/current/kernels/generated";
 
@@ -20,15 +20,12 @@ using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
 class Stream {
   public: 
     Stream(std::vector<uint32_t> inital_data, size_t num_elements, tt::DataFormat data_format) {
-        assert(inital_data.size() * 4 == num_elements * tt::datum_size(data_format));
+        assert(inital_data.size() * 4 == num_elements * tt::datum_size(data_format) && "Stream data size does not match number of elements!");
         n_elements = num_elements;
         host_data = inital_data;
         this->element_size = tt::datum_size(data_format);
         this->data_format = data_format;
         this->n_tiles = std::ceil(n_elements / TILE_SIZE);
-        // std::cout << "Stream n_tiles: " << n_tiles << "\n";
-        // std::cout << "Stream n_elements: " << n_elements << "\n";
-        // std::cout << "Stream element_size: " << element_size << "\n";
     }
 
   private:
@@ -164,8 +161,6 @@ class Map {
 
     void add_connection(const Endpoint& src, const Endpoint& dst) {
         connections.push_back({src, dst});
-        std::cout << "Added connection: " << src.index << " -> " << dst.index << "\n";
-        std::cout << "Total connections: " << connections.size() << "\n";
     }
 
     void generate_reader_device_kernel(Kernel *kernel, std::vector<Kernel::Port> input_ports, std::vector<Connection> incoming_connections);
@@ -174,4 +169,4 @@ class Map {
     bool has_incoming_connection(Kernel *kernel);
 };
 
-} // End namespace stream.
+} // End namespace current.
