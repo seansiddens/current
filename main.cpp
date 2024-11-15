@@ -156,6 +156,11 @@ int main(int argc, char **argv) {
 
     // Kernel generation.
     current::Kernel reader_kernel0;
+    // Every implicitly has the input variable "inN" and result needs to be assigned to "outN".
+    // The type of N is the index of the port.
+    reader_kernel0.set_compute_kernel(R"(
+        out0 = in0 * 2.0f + 1.0f;
+    )");
     // TODO: Automatically assign CBs to kernels? Also have a typed port? 
     reader_kernel0.add_input_port("in0", tt::DataFormat::Float16_b);
     reader_kernel0.add_output_port("out0", tt::DataFormat::Float16_b);

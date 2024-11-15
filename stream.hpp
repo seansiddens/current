@@ -54,6 +54,10 @@ class Kernel {
     uint32_t num_input_ports() const;
     uint32_t num_output_ports() const;
 
+    void set_compute_kernel(const std::string& sfpi_kernel_string) {
+        this->sfpi_kernel_string = sfpi_kernel_string;
+    }
+
     uint32_t get_input_port_index(std::string port_name) const {
         for (size_t i = 0; i < input_ports.size(); i++) {
             if (input_ports[i].name == port_name) {
@@ -91,6 +95,7 @@ class Kernel {
     std::filesystem::path generated_reader_kernel_path;
     std::filesystem::path generated_compute_kernel_path;
     std::filesystem::path generated_writer_kernel_path;
+    std::string sfpi_kernel_string;
 };
 
 class Map {

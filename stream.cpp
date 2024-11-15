@@ -410,16 +410,35 @@ void Map::generate_compute_device_kernel(
     cs << "\n";
 
     // SFPU computation
-    // TODO: Need to somehow parameterize this compute source code generation.
     cs << "namespace sfpi {\n";
     cs << "template< int ITERATIONS = 16 >\n";
     cs << "sfpi_inline void compute() {\n";
-    cs << "    for (int i = 0; i < ITERATIONS; i++) {\n";
-    cs << "        vFloat in = dst_reg[i];\n";
-    cs << "        vFloat a = in + 1.0f;\n";
-    cs << "        vFloat out = a;\n";
-    cs << "        dst_reg[i] = out;\n";
-    cs << "    }\n";
+    // If we don't have a specifed compute kernel, don't generate anything.
+    if (!kernel->sfpi_kernel_string.empty()) {
+        cs << "    for (int i = 0; i < ITERATIONS; i++) {\n";
+        // Get input variables.
+        for (size_t i = 0; i < input_ports.size(); i++) {
+            // TODO: Need to figure out the indexing of the dst regs for multiple inputs.
+            cs << "        vFloat in" << i << " = dst_reg[i];\n";
+        }
+        // Declare output variables.
+        for (size_t i = 0; i < output_ports.size(); i++) {
+            cs << "        vFloat out" << i << ";\n";
+        }
+        cs << kernel->sfpi_kernel_string;
+        // Assign output variables.
+        for (size_t i = 0; i < output_ports.size(); i++) {
+            // TODO: Need to figure out the indexing of the dst regs for multiple outputs.
+            cs << "        dst_reg[i] = out" << i << ";\n";
+        }
+        cs << "    }\n";
+    }
+    // cs << "    for (int i = 0; i < ITERATIONS; i++) {\n";
+    // cs << "        vFloat in = dst_reg[i];\n";
+    // cs << "        vFloat a = in + 1.0f;\n";
+    // cs << "        vFloat out = a;\n";
+    // cs << "        dst_reg[i] = out;\n";
+    // cs << "    }\n";
     cs << "}\n";
     cs << "}\n";
     cs << "\n";
