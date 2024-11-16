@@ -17,10 +17,32 @@ namespace current {
 
 // Add a new input or output port to the kernel
 void Kernel::add_input_port(const std::string& name, tt::DataFormat data_format)  {
+    assert(input_ports.size() < MAX_INPUT_PORTS && "Kernel has too many input ports!");
+    
+    // Check if port name already exists in input ports
+    for (const auto& port : input_ports) {
+        assert(port.name != name && "Input port with this name already exists!");
+    }
+    // Check if port name already exists in output ports
+    for (const auto& port : output_ports) {
+        assert(port.name != name && "Port name already exists as an output port!");
+    }
+    
     input_ports.push_back({name, data_format});
 }
 
 void Kernel::add_output_port(const std::string& name, tt::DataFormat data_format) {
+    assert(output_ports.size() < MAX_OUTPUT_PORTS && "Kernel has too many output ports!");
+    
+    // Check if port name already exists in output ports
+    for (const auto& port : output_ports) {
+        assert(port.name != name && "Output port with this name already exists!");
+    }
+    // Check if port name already exists in input ports
+    for (const auto& port : input_ports) {
+        assert(port.name != name && "Port name already exists as an input port!");
+    }
+    
     output_ports.push_back({name, data_format});
 }
 
@@ -32,7 +54,14 @@ uint32_t Kernel::num_output_ports() const {
     return output_ports.size();
 }
 
-Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams) : kernels(kernels), streams(streams) {}
+Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams) : kernels(kernels), streams(streams) {
+    // Check that all streams have the same number of elements.
+    for (size_t i = 1; i < streams.size(); i++) {
+        // TODO: Eventually we want to support streams of different sizes e.g for reduction kernels,
+        // but right now we just check that all streams have the same number of elements.
+        assert(streams[i]->n_elements == streams[0]->n_elements && "All streams must have the same number of elements!");
+    }
+}
 
 // TODO: Validate that port connections are valid (check that types are the same.)
 void Map::add_connection(Kernel *src, std::string src_out, Kernel *dst, std::string dst_in) {
@@ -65,6 +94,8 @@ void Map::add_connection(Kernel *src, std::string src_out, Stream *dst) {
 }
 
 void Map::execute() {
+    check_connections();
+
     // 1. Create device and program.
     runtime.device = tt_metal::CreateDevice(0);
     if (!runtime.device) {
@@ -81,9 +112,9 @@ void Map::execute() {
     runtime.num_cores_x = compute_with_storage_grid_size.x;
     runtime.num_cores_y = compute_with_storage_grid_size.y;
     runtime.core_set = num_cores_to_corerange_set({0, 0}, runtime.num_cores, {runtime.num_cores_x, runtime.num_cores_y});
-    tt::log_info("num_cores_x: {}, num_cores_y: {}", runtime.num_cores_x, runtime.num_cores_y);
-    tt::log_info("core_set: {}", runtime.core_set);
-    tt::log_info("Total cores: {}", (*runtime.core_set.begin()).size());
+    tt::log_info("[CURRENT] num_cores_x: {}, num_cores_y: {}", runtime.num_cores_x, runtime.num_cores_y);
+    tt::log_info("[CURRENT] core_set: {}", runtime.core_set);
+    tt::log_info("[CURRENT] Total cores: {}", (*runtime.core_set.begin()).size());
 
     // 3. Input & Output DRAM buffer setup.
     for (size_t i = 0; i < streams.size(); i++) {
@@ -121,29 +152,33 @@ void Map::execute() {
         // possibly doing automatic parallelization of kernels.
         // NOTE: This also requires that we need as many cores as kernels.
         kernel->core_spec = cores[i];
+        auto incoming_connections = get_incoming_connections(kernel);
+        auto outgoing_connections = get_outgoing_connections(kernel);
 
-        // Create circular buffers for each input and output port.
-        for (size_t i = 0; i < kernel->num_input_ports(); i++) {
+        // Create circular buffers for each incoming and outgoing connection.
+        for (size_t i = 0; i < incoming_connections.size(); i++) {
             // Each port is typed with a specific data format. 
             auto cb_index = i + IN_CB_START;
-            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(kernel->input_ports[i].data_format);
-            auto input_port = kernel->input_ports[i];
+            auto port_index = incoming_connections[i].dest.index;
+            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(kernel->input_ports[port_index].data_format);
+            auto port = kernel->input_ports[port_index];
             tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
                 TILES_PER_CB * tile_size_bytes,
-                {{cb_index, input_port.data_format}}
+                {{cb_index, port.data_format}}
             ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
-            kernel->input_ports[i].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
+            kernel->input_ports[port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
         }
 
-        for (size_t i = 0; i < kernel->num_output_ports(); i++) {
+        for (size_t i = 0; i < outgoing_connections.size(); i++) {
             auto cb_index = i + OUT_CB_START;
-            auto output_port = kernel->output_ports[i];
-            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(output_port.data_format);
+            auto port_index = outgoing_connections[i].source.index;
+            auto port = kernel->output_ports[port_index];
+            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(port.data_format);
             tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
                 TILES_PER_CB * tile_size_bytes,
-                {{cb_index, output_port.data_format}}
+                {{cb_index, port.data_format}}
             ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
-            kernel->output_ports[i].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
+            kernel->output_ports[port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
         }
 
         // Create device kernels.
@@ -189,8 +224,6 @@ void Map::execute() {
         kernel->writer_kernel = writer;
 
         // Set runtime args.
-        auto incoming_connections = get_incoming_connections(kernel);
-        auto outgoing_connections = get_outgoing_connections(kernel);
         std::vector<uint32_t> reader_args;
         std::vector<uint32_t> compute_args;
         for (const auto& connection : incoming_connections) {
@@ -235,11 +268,11 @@ void Map::execute() {
     // TODO: Right now we just hard-code this to the last stream, but need to figure out what streams we want to read from. 
     // Could copy ALL streams's data back to their host buffer, then let the user decide which ones to read from via a Stream method.
     std::vector<uint32_t> out;
-    tt_metal::EnqueueReadBuffer(runtime.device->command_queue(), streams[1]->device_buffer, out, true);
+    tt_metal::EnqueueReadBuffer(runtime.device->command_queue(), streams[streams.size() - 1]->device_buffer, out, true);
 
     std::vector<bfloat16> output_data = unpack_uint32_vec_into_bfloat16_vec(out);
     for (uint32_t i = 0; i < output_data.size(); i++) {
-        std::cout << output_data[i].to_float() << " ";
+        std::cout << i << ": " << output_data[i].to_float() << "\n";
     }
     std::cout << std::endl;
 
@@ -303,14 +336,13 @@ std::string data_format_to_string(tt::DataFormat data_format) {
 
 void Map::generate_reader_device_kernel(
     Kernel *kernel,
-    std::vector<Kernel::Port> input_ports,
     std::vector<Connection> incoming_connections
 ) {
-
     // Generate reader kernel.
     std::stringstream rs;
     rs << "#include <cstdint>\n";
     rs << "#include \"dataflow_api.h\"\n";
+    rs << "#include \"debug/dprint.h\"\n";
     rs << "void kernel_main() {\n";
 
     // Reader params from kernel args
@@ -322,16 +354,16 @@ void Map::generate_reader_device_kernel(
             auto stream = streams[connection.source.index];
             // Total # of tiles this kernel will read from this stream.
             // Stream -> Kernel, get the input port index.
-            auto port_index = kernel->get_input_port_index(connection.dest.port);
-            rs << "    uint32_t source" << port_index << "_n_tiles = get_arg_val<uint32_t>(" << total_args << ");\n";
+            auto port = kernel->get_input_port(connection.dest.port);
+            rs << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
             total_args++;
             // For every incoming stream connection, we need to get it's address and create an address generator.
-            rs << "    uint32_t source" << port_index << "_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
+            rs << "    uint32_t " << port.name << "_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
             total_args++;
             // Address generator.
             // TODO: Do we need this? How does this even work?
-            rs << "    const InterleavedAddrGenFast<true> source" << port_index << "_addr_gen = {\n";
-            rs << "        .bank_base_address = source" << port_index << "_addr, \n";
+            rs << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
+            rs << "        .bank_base_address = " << port.name << "_addr, \n";
             rs << "        .page_size = " << TILE_WIDTH * TILE_HEIGHT * stream->element_size << ", \n";
             rs << "        .data_format = " << data_format_to_string(stream->data_format) << ", \n";
             rs << "    };\n\n";
@@ -344,40 +376,74 @@ void Map::generate_reader_device_kernel(
 
     // Circular buffers.
     uint32_t num_input_cbs = 0;
-    for (size_t i = 0; i < input_ports.size(); i++) {
+    for (size_t i = 0; i < incoming_connections.size(); i++) {
         // Assign CBs to input ports in iteration order.
-        auto port = input_ports[i];
+        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
         rs << "    constexpr uint32_t " << port.name << " = " << num_input_cbs << ";\n";
         num_input_cbs++;
     }
     rs << "\n";
 
-    // Input tile stream loop.
-    // TODO: Handle multiple input ports with DIFFERENT n_tiles.
-    // In the loop, need to keep track of how many tiles we've read from each input port.
-    // Break condition is when we've read the expected # of tiles from each input port.
-    rs << "    for(uint32_t i = 0; i < source0_n_tiles; i++) {\n";
-    // Wait for space in CBs
-    for (size_t i = 0; i < input_ports.size(); i++) {
-        rs << "        cb_reserve_back(" << input_ports[i].name << ", 1);\n";
-    }
-    // Read tile into CB from DRAM.
-    for (size_t i = 0; i < input_ports.size(); i++) {
-        rs << "        uint32_t " << input_ports[i].name << "_write_ptr = get_write_ptr(" << input_ports[i].name << ");\n";
-        rs << "        noc_async_read_tile(i, source" << i << "_addr_gen, " << input_ports[i].name << "_write_ptr);\n";
-    }
-    // Wait until tile reads are done.
-    rs << "\n";
-    rs << "        noc_async_read_barrier();\n";
+    if (incoming_connections.size() > 0) {
+        // Input tile stream loop.
+        for (size_t i = 0; i < incoming_connections.size(); i++) {
+            // Generate a counter variable for every incoming connection. 
+            // Each incoming connection maps to a specific input port, which is managed by a CB.
+            auto connection = incoming_connections[i];
+            auto port = kernel->get_input_port(connection.dest.port);
+            rs << "    uint32_t " << port.name << "_count = 0;\n";
+        }
 
-    // Push tiles into CBs
-    // Signals to compute engine that a tile is ready to be processed.
-    for (size_t i = 0; i < input_ports.size(); i++) {
-        rs << "        cb_push_back(" << input_ports[i].name << ", 1);\n";
-    }
+        // The break condition is when we've read the expected # of tiles from each input port.
+        // TODO: The only case when the incoming stream sizes would be different is if we are doing some sort of reduction on a stream 
+        // e.g for each record of stream A we are dequining 4 records from stream B.
+        // In this case, we might be requesting/dequing N tiles at once. This needs to somehow be handled in the compute kernel.
+        // Right now even though we are acting as if the streams are different sizes, the compute kernel is still acting as if they are the same size.
+        std::string break_condition = "";
+        for (size_t i = 0; i < incoming_connections.size(); i++) {
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            break_condition += port.name + "_count < " + port.name + "_ntiles";
+            if (i != incoming_connections.size() - 1) {
+                break_condition += " && ";
+            }
+        }
 
-    rs << "    }\n";
-    // End tile stream loop.
+        // rs << "    for(uint32_t i = 0; i < source0_n_tiles; i++) {\n";
+        rs << "    while(" << break_condition << ") {\n";
+
+        // Wait for space in CBs
+        for (size_t i = 0; i < incoming_connections.size(); i++) {
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
+            rs << "            cb_reserve_back(" << port.name << ", 1);\n";
+            rs << "        }\n";
+        }
+        // Read tile into CB from DRAM.
+        for (size_t i = 0; i < incoming_connections.size(); i++) {
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
+            rs << "            uint32_t " << port.name << "_write_ptr = get_write_ptr(" << port.name << ");\n";
+            rs << "            noc_async_read_tile(" << port.name<< "_count, " <<  port.name << "_addr_gen, " << port.name << "_write_ptr);\n";
+            rs << "        }\n";
+        }
+        // Wait until tile reads are done.
+        rs << "\n";
+        rs << "        noc_async_read_barrier();\n";
+        rs << "\n";
+
+        // Push tiles into CBs and increment counters.
+        // Signals to compute engine that a tile is ready to be processed.
+        for (size_t i = 0; i < incoming_connections.size(); i++) {
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
+            rs << "            cb_push_back(" << port.name << ", 1);\n";
+            rs << "            " << port.name << "_count++;\n";
+            rs << "        }\n";
+        }
+
+        rs << "    }\n";
+        // End tile stream loop.
+    }
 
     rs << "}\n";
     rs << "\n";
@@ -386,7 +452,7 @@ void Map::generate_reader_device_kernel(
     kernel->generated_reader_kernel_path = GENERATED_KERNELS_PATH / filename;
     auto reader_kernel_file = std::ofstream(kernel->generated_reader_kernel_path);
     if (!reader_kernel_file.is_open()) {
-        tt::log_error("Failed to open file for writing: {}", kernel->generated_reader_kernel_path);
+        tt::log_error("[CURRENT] Failed to open file for writing: {}", kernel->generated_reader_kernel_path);
         exit(1);
     }
     reader_kernel_file << rs.str();
@@ -395,8 +461,8 @@ void Map::generate_reader_device_kernel(
 
 void Map::generate_compute_device_kernel(
     Kernel *kernel,
-    std::vector<Kernel::Port> input_ports,
-    std::vector<Kernel::Port> output_ports
+    std::vector<Connection> incoming_connections,
+    std::vector<Connection> outgoing_connections
 ) {
     std::stringstream cs; 
     // Includes
@@ -411,27 +477,30 @@ void Map::generate_compute_device_kernel(
 
     // SFPU computation
     cs << "namespace sfpi {\n";
-    cs << "template< int ITERATIONS = 16 >\n";
+    // cs << "template< int ITERATIONS = 16 >\n";
     cs << "sfpi_inline void compute() {\n";
     // If we don't have a specifed compute kernel, don't generate anything.
     if (!kernel->sfpi_kernel_string.empty()) {
-        cs << "    for (int i = 0; i < ITERATIONS; i++) {\n";
+        // TODO: Do a better optimization if we don't have a compute kernel.
+        // Can probably avoid any call to the sfpi function, don't need to do sfpi init? idk
+        cs << "    for (int i = 0; i < 16; i++) {\n";
         // Get input variables.
-        for (size_t i = 0; i < input_ports.size(); i++) {
+        for (size_t i = 0; i < incoming_connections.size(); i++) {
             // TODO: Need to figure out the indexing of the dst regs for multiple inputs.
-            cs << "        vFloat in" << i << " = dst_reg[i];\n";
+            cs << "        vFloat in" << i << " = dst_reg[" << i << " * 16 + i];\n";
         }
         // Declare output variables.
-        for (size_t i = 0; i < output_ports.size(); i++) {
+        for (size_t i = 0; i < outgoing_connections.size(); i++) {
             cs << "        vFloat out" << i << ";\n";
         }
         cs << kernel->sfpi_kernel_string;
         // Assign output variables.
-        for (size_t i = 0; i < output_ports.size(); i++) {
+        for (size_t i = 0; i < outgoing_connections.size(); i++) {
             // TODO: Need to figure out the indexing of the dst regs for multiple outputs.
-            cs << "        dst_reg[i] = out" << i << ";\n";
+            cs << "        dst_reg[" << i << " * 16 + i] = out" << i << ";\n";
         }
         cs << "    }\n";
+
     }
     // cs << "    for (int i = 0; i < ITERATIONS; i++) {\n";
     // cs << "        vFloat in = dst_reg[i];\n";
@@ -460,17 +529,17 @@ void Map::generate_compute_device_kernel(
     // e.g letting us have more ports or use them more efficiently.
     // We also might end up using intermediate CBs at some point for computation.
     uint32_t num_input_cbs = IN_CB_START;
-    for (size_t i = 0; i < input_ports.size(); i++) {
+    for (size_t i = 0; i < incoming_connections.size(); i++) {
         // Assign CBs to input ports in iteration order.
-        auto port = input_ports[i];
+        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
         cs << "    constexpr uint32_t " << port.name << " = " << num_input_cbs << ";\n";
         num_input_cbs++;
     }
     cs << "\n";
     uint32_t num_output_cbs = OUT_CB_START; // Output CBs start at index 16.
-    for (size_t i = 0; i < output_ports.size(); i++) {
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
         // Assign CBs to output ports in iteration order.
-        auto port = output_ports[i];
+        auto port = kernel->get_output_port(outgoing_connections[i].source.port);
         cs << "    constexpr uint32_t " << port.name << " = " << num_output_cbs << ";\n";
         num_output_cbs++;
     }
@@ -479,21 +548,25 @@ void Map::generate_compute_device_kernel(
 
 
     // Initialize SFPU.
-    for (size_t i = 0; i < input_ports.size(); i++) {
-        cs << "    init_sfpu(" << input_ports[i].name << ");\n";
+    for (size_t i = 0; i < incoming_connections.size(); i++) {
+        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+        cs << "    init_sfpu(" << port.name << ");\n";
     }
     cs << "\n";
 
     // Tile stream loop
+    // TODO: Right now just going to assume that all streams have the same number of tiles.
     cs << "    for(uint32_t i = 0; i < n_tiles; i++) {\n";
     // Wait for tiles to be read in CBs.
-    for (size_t i = 0; i < input_ports.size(); i++) {
-        cs << "        cb_wait_front(" << input_ports[i].name << ", 1);\n";
+    for (size_t i = 0; i < incoming_connections.size(); i++) {
+        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+        cs << "        cb_wait_front(" << port.name << ", 1);\n";
     }
     cs << "\n";
 
     // Copy tiles from CBs to SFPU registers.
-    for (size_t i = 0; i < input_ports.size(); i++) {
+    for (size_t i = 0; i < incoming_connections.size(); i++) {
+        auto port = kernel->get_input_port(incoming_connections[incoming_connections.size() - i - 1].dest.port);
         /**
         * Copies a single tile from the specified input CB and writes the result to
         * DST at a specified index. The function will employ unpacker to first unpack into SRC
@@ -513,35 +586,39 @@ void Map::generate_compute_device_kernel(
         * | in_tile_index  | The index of the tile to copy from the input CB   | uint32_t  | Must be less than the size of the CB                | Yes      |
         * | dst_tile_index | The index of the tile in the DST register         | uint32_t  | Must be less than the size of the DST register (16) | Yes      |
         * */
-        cs << "        copy_tile(" << input_ports[i].name << ", 0, " << i << ");\n";
+        cs << "        copy_tile(" << port.name << ", 0, " << incoming_connections.size() - i - 1 << ");\n";
     }
     cs << "\n";
     cs << "        tile_regs_acquire();\n";
-    cs << "        MATH((sfpi::compute<16>()));\n";
+    cs << "        MATH((sfpi::compute()));\n";
     cs << "        tile_regs_commit();\n";
     cs << "\n";
     // Computation finished, pop tiles from input CBs
     // TODO: This may be able to be re-ordered?
-    for (size_t i = 0; i < input_ports.size(); i++) {
-        cs << "        cb_pop_front(" << input_ports[i].name << ", 1);\n";
+    for (size_t i = 0; i < incoming_connections.size(); i++) {
+        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+        cs << "        cb_pop_front(" << port.name << ", 1);\n";
     }
     cs << "\n";
 
     // Packer waits here until the SFPU is done.
     cs << "        tile_regs_wait();\n";
     // Reserve space in output CBs.
-    for (size_t i = 0; i < output_ports.size(); i++) {
-        cs << "        cb_reserve_back(" << output_ports[i].name << ", 1);\n";
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto port = kernel->get_output_port(outgoing_connections[i].source.port);
+        cs << "        cb_reserve_back(" << port.name << ", 1);\n";
     }
     cs << "\n";
     // Pack tiles into output CBs.
-    for (size_t i = 0; i < output_ports.size(); i++) {
-        cs << "        pack_tile(" << i << ", " << output_ports[i].name << ");\n";
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto port = kernel->get_output_port(outgoing_connections[i].source.port);
+        cs << "        pack_tile(" << i << ", " << port.name << ");\n";
     }
     cs << "\n";
     // Announce that the output tiles are ready.
-    for (size_t i = 0; i < output_ports.size(); i++) {
-        cs << "        cb_push_back(" << output_ports[i].name << ", 1);\n";
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto port = kernel->get_output_port(outgoing_connections[i].source.port);
+        cs << "        cb_push_back(" << port.name << ", 1);\n";
     }
     cs << "\n";
 
@@ -561,7 +638,7 @@ void Map::generate_compute_device_kernel(
     kernel->generated_compute_kernel_path = GENERATED_KERNELS_PATH / filename;
     auto compute_kernel_file = std::ofstream(kernel->generated_compute_kernel_path);
     if (!compute_kernel_file.is_open()) {
-        tt::log_error("Failed to open file for writing: {}", kernel->generated_compute_kernel_path);
+        tt::log_error("[CURRENT] Failed to open file for writing: {}", kernel->generated_compute_kernel_path);
         exit(1);
     }
     compute_kernel_file << cs.str();
@@ -570,7 +647,6 @@ void Map::generate_compute_device_kernel(
 
 void Map::generate_writer_device_kernel(
     Kernel *kernel,
-    std::vector<Kernel::Port> output_ports,
     std::vector<Connection> outgoing_connections
 ) {
 
@@ -592,17 +668,17 @@ void Map::generate_writer_device_kernel(
             // Need to think about how to do this automatically (e.g analyzing the # of tiles we stream in and out for each tile).
             auto stream = streams[connection.dest.index];
             // Kernel -> Stream, get the output port index.
-            auto port_index = kernel->get_output_port_index(connection.source.port);
+            auto port = kernel->get_output_port(connection.source.port);
             // Total # of tiles this kernel will write to this stream.
-            ws << "    uint32_t sink" << port_index << "_n_tiles = get_arg_val<uint32_t>(" << total_args << ");\n";
+            ws << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
             total_args++;
             // For every outgoing stream connection, we need to get it's address and create an address generator.
-            ws << "    uint32_t sink" << port_index << "_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
+            ws << "    uint32_t " << port.name << "_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
             total_args++;
             // Address generator.
             // TODO: Do we need this? How does this even work?
-            ws << "    const InterleavedAddrGenFast<true> sink" << port_index << "_addr_gen = {\n";
-            ws << "        .bank_base_address = sink" << port_index << "_addr, \n";
+            ws << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
+            ws << "        .bank_base_address = " << port.name << "_addr, \n";
             ws << "        .page_size = " << TILE_WIDTH * TILE_HEIGHT * stream->element_size << ", \n";
             ws << "        .data_format = " << data_format_to_string(stream->data_format) << ", \n";
             ws << "    };\n\n";
@@ -613,9 +689,9 @@ void Map::generate_writer_device_kernel(
 
     // Circular buffers.
     uint32_t num_output_cbs = OUT_CB_START; // Output CBs start at index 16.
-    for (size_t i = 0; i < output_ports.size(); i++) {
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
         // Assign CBs to input ports in iteration order.
-        auto port = output_ports[i];
+        auto port = kernel->get_output_port(outgoing_connections[i].source.port);
         ws << "    constexpr uint32_t " << port.name << " = " << num_output_cbs << ";\n";
         num_output_cbs++;
     }
@@ -625,26 +701,30 @@ void Map::generate_writer_device_kernel(
     // TODO: Handle multiple output ports with DIFFERENT n_tiles.
     // In the loop, need to keep track of how many tiles we've written to each output port.
     // Break condition is when we've written the expected # of tiles to each output port.
-    ws << "    for(uint32_t i = 0; i < sink0_n_tiles; i++) {\n";
+    ws << "    for(uint32_t i = 0; i < " << outgoing_connections[0].source.port << "_ntiles; i++) {\n";
     // Wait tiles to arrive in CBs
-    for (size_t i = 0; i < output_ports.size(); i++) {
-        ws << "        cb_wait_front(" << output_ports[i].name << ", 1);\n";
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto port = kernel->get_output_port(outgoing_connections[i].source.port);
+        ws << "        cb_wait_front(" << port.name << ", 1);\n";
     }
 
     // Write tiles to DRAM.
-    for (size_t i = 0; i < output_ports.size(); i++) {
-        ws << "        uint32_t " << output_ports[i].name << "_read_ptr = get_read_ptr(" << output_ports[i].name << ");\n";
-        ws << "        noc_async_write_tile(i, sink" << i << "_addr_gen, " << output_ports[i].name << "_read_ptr);\n";
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto port = kernel->get_output_port(outgoing_connections[i].source.port);
+        ws << "        uint32_t " << port.name << "_read_ptr = get_read_ptr(" << port.name << ");\n";
+        ws << "        noc_async_write_tile(i, " << port.name << "_addr_gen, " << port.name << "_read_ptr);\n";
     }
     // Wait until tile writes are done.
     ws << "\n";
     ws << "        noc_async_write_barrier();\n";
+    ws << "\n";
     // // TODO: Potentially slower than just using noc_async_write_flushed().
     // // Might not even have to use until the last tile is written.
 
     // Mark the tiles as consumed.
-    for (size_t i = 0; i < output_ports.size(); i++) {
-        ws << "        cb_pop_front(" << output_ports[i].name << ", 1);\n";
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto port = kernel->get_output_port(outgoing_connections[i].source.port);
+        ws << "        cb_pop_front(" << port.name << ", 1);\n";
     }
     ws << "    }\n";
     // End tile stream loop.
@@ -658,7 +738,7 @@ void Map::generate_writer_device_kernel(
     kernel->generated_writer_kernel_path = GENERATED_KERNELS_PATH / filename;
     auto writer_kernel_file = std::ofstream(kernel->generated_writer_kernel_path);
     if (!writer_kernel_file.is_open()) {
-        tt::log_error("Failed to open file for writing: {}", kernel->generated_writer_kernel_path);
+        tt::log_error("[CURRENT] Failed to open file for writing: {}", kernel->generated_writer_kernel_path);
         exit(1);
     }
     writer_kernel_file << ws.str();
@@ -668,16 +748,12 @@ void Map::generate_writer_device_kernel(
 void Map::generate_device_kernels() {
     for (int i = 0; i < kernels.size(); i++) {
         Kernel *kernel = kernels[i];
-        auto input_ports = kernel->input_ports;
-        auto output_ports = kernel->output_ports;
-        auto num_input_ports = kernel->num_input_ports();
-        auto num_output_ports = kernel->num_output_ports();
         auto incoming_connections = get_incoming_connections(kernel);
         auto outgoing_connections = get_outgoing_connections(kernel);
 
-        generate_reader_device_kernel(kernel, input_ports, incoming_connections);
-        generate_compute_device_kernel(kernel, input_ports, output_ports);
-        generate_writer_device_kernel(kernel, output_ports, outgoing_connections);
+        generate_reader_device_kernel(kernel, incoming_connections);
+        generate_compute_device_kernel(kernel, incoming_connections, outgoing_connections);
+        generate_writer_device_kernel(kernel, outgoing_connections);
     }
 }
 
@@ -722,6 +798,66 @@ void Map::export_dot(const std::string& filename) const {
     
     dot_file << "}\n";
     dot_file.close();
+}
+
+void Map::check_connections() {
+    bool flag = false;
+
+    // Check all kernel ports have connections
+    for (size_t kernel_idx = 0; kernel_idx < kernels.size(); kernel_idx++) {
+        Kernel* kernel = kernels[kernel_idx];
+        
+        // Check input ports
+        for (const auto& input_port : kernel->input_ports) {
+            bool found = false;
+            for (const auto& conn : connections) {
+                if (conn.dest.is_kernel() && 
+                    conn.dest.index == kernel_idx && 
+                    conn.dest.port == input_port.name) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                tt::log_warning("[CURRENT] Kernel {} input port '{}' has no connection", kernel_idx, input_port.name);
+            }
+        }
+
+        // Check output ports
+        for (const auto& output_port : kernel->output_ports) {
+            bool found = false;
+            for (const auto& conn : connections) {
+                if (conn.source.is_kernel() && 
+                    conn.source.index == kernel_idx && 
+                    conn.source.port == output_port.name) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                tt::log_warning("[CURRENT] Kernel {} output port '{}' has no connection", kernel_idx, output_port.name);
+                flag = true;
+            }
+        }
+    }
+
+    // Check all streams have connections
+    for (size_t stream_idx = 0; stream_idx < streams.size(); stream_idx++) {
+        bool found = false;
+        for (const auto& conn : connections) {
+            if ((conn.source.is_stream() && conn.source.index == stream_idx) ||
+                (conn.dest.is_stream() && conn.dest.index == stream_idx)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            tt::log_warning("[CURRENT] Stream {} has no connections", stream_idx);
+            flag = true;
+        }
+    }
+
+    assert(!flag && "Missing connections in map!");
 }
 
 } // End namespace current

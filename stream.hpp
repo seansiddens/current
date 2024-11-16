@@ -19,10 +19,10 @@ using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
 // Wrapper around a DRAM buffer. Used as source and dest of stream data for kernels.
 class Stream {
   public: 
-    Stream(std::vector<uint32_t> inital_data, size_t num_elements, tt::DataFormat data_format) {
-        assert(inital_data.size() * 4 == num_elements * tt::datum_size(data_format) && "Stream data size does not match number of elements!");
+    Stream(const std::vector<uint32_t>& initial_data, size_t num_elements, tt::DataFormat data_format) {
+        assert(initial_data.size() * 4 == num_elements * tt::datum_size(data_format) && "Stream data size does not match number of elements!");
         n_elements = num_elements;
-        host_data = inital_data;
+        host_data = initial_data;
         this->element_size = tt::datum_size(data_format);
         this->data_format = data_format;
         this->n_tiles = std::ceil(n_elements / TILE_SIZE);
@@ -49,13 +49,20 @@ class Kernel {
   public: 
     Kernel() = default;
 
+    struct Port {
+        std::string name;
+        tt::DataFormat data_format;
+        tt_metal::CBHandle cb; // TODO: Do we want ports to have ownership of CBs?
+    };
+
     void add_input_port(const std::string& name, tt::DataFormat data_format);
     void add_output_port(const std::string& name, tt::DataFormat data_format);
     uint32_t num_input_ports() const;
     uint32_t num_output_ports() const;
 
-    void set_compute_kernel(const std::string& sfpi_kernel_string) {
-        this->sfpi_kernel_string = sfpi_kernel_string;
+    void set_compute_kernel(const std::string& code) {
+        size_t last = code.find_last_not_of(" \t\n\r");
+        sfpi_kernel_string = (last != std::string::npos) ? code.substr(0, last + 1) + "\n\n" : "";
     }
 
     uint32_t get_input_port_index(std::string port_name) const {
@@ -67,6 +74,24 @@ class Kernel {
         return -1;
     }
 
+    Port get_input_port(std::string port_name) const {
+        for (size_t i = 0; i < input_ports.size(); i++) {
+            if (input_ports[i].name == port_name) {
+                return input_ports[i];
+            }
+        }
+        assert(false && "Input port not found!");
+    }
+
+    Port get_output_port(std::string port_name) const {
+        for (size_t i = 0; i < output_ports.size(); i++) {
+            if (output_ports[i].name == port_name) {
+                return output_ports[i];
+            }
+        }
+        assert(false && "Output port not found!");
+    }
+
     uint32_t get_output_port_index(std::string port_name) const {
         for (size_t i = 0; i < output_ports.size(); i++) {
             if (output_ports[i].name == port_name) {
@@ -76,11 +101,6 @@ class Kernel {
         return -1;
     }
 
-    struct Port {
-        std::string name;
-        tt::DataFormat data_format;
-        tt_metal::CBHandle cb; // TODO: Do we want ports to have ownership of CBs?
-    };
 
     // TODO: For each input port, we need need a CB to move data from NOC to compute.
     // If the kernel is a generator, each input port will be reading from a DRAM buffer.
@@ -106,6 +126,7 @@ class Map {
     void add_connection(Kernel *src, std::string src_out, Stream *dst);
     void execute();
     void generate_device_kernels();
+    void check_connections();
 
     // Visualize the work graph.
     // For PNG
@@ -157,20 +178,24 @@ class Map {
     std::vector<Connection> get_outgoing_connections(Kernel *kernel);
 
     size_t get_kernel_index(Kernel *kernel) {
-        return std::find(kernels.begin(), kernels.end(), kernel) - kernels.begin();
+        auto it = std::find(kernels.begin(), kernels.end(), kernel);
+        assert(it != kernels.end() && "Kernel not found in kernels vector");
+        return it - kernels.begin();
     }
 
     size_t get_stream_index(Stream *stream) {
-        return std::find(streams.begin(), streams.end(), stream) - streams.begin();
+        auto it = std::find(streams.begin(), streams.end(), stream);
+        assert(it != streams.end() && "Stream not found in streams vector");
+        return it - streams.begin();
     }
 
     void add_connection(const Endpoint& src, const Endpoint& dst) {
         connections.push_back({src, dst});
     }
 
-    void generate_reader_device_kernel(Kernel *kernel, std::vector<Kernel::Port> input_ports, std::vector<Connection> incoming_connections);
-    void generate_compute_device_kernel(Kernel *kernel, std::vector<Kernel::Port> input_ports, std::vector<Kernel::Port> output_ports);
-    void generate_writer_device_kernel(Kernel *kernel, std::vector<Kernel::Port> output_ports, std::vector<Connection> outgoing_connections);
+    void generate_reader_device_kernel(Kernel *kernel, std::vector<Connection> incoming_connections);
+    void generate_compute_device_kernel(Kernel *kernel, std::vector<Connection> incoming_connections, std::vector<Connection> outgoing_connections);
+    void generate_writer_device_kernel(Kernel *kernel, std::vector<Connection> outgoing_connections);
     bool has_incoming_connection(Kernel *kernel);
 };
 
