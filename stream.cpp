@@ -486,7 +486,6 @@ void Map::generate_compute_device_kernel(
         cs << "    for (int i = 0; i < 16; i++) {\n";
         // Get input variables.
         for (size_t i = 0; i < incoming_connections.size(); i++) {
-            // TODO: Need to figure out the indexing of the dst regs for multiple inputs.
             cs << "        vFloat in" << i << " = dst_reg[" << i << " * 16 + i];\n";
         }
         // Declare output variables.
@@ -496,7 +495,6 @@ void Map::generate_compute_device_kernel(
         cs << kernel->sfpi_kernel_string;
         // Assign output variables.
         for (size_t i = 0; i < outgoing_connections.size(); i++) {
-            // TODO: Need to figure out the indexing of the dst regs for multiple outputs.
             cs << "        dst_reg[" << i << " * 16 + i] = out" << i << ";\n";
         }
         cs << "    }\n";
@@ -567,6 +565,7 @@ void Map::generate_compute_device_kernel(
     // Copy tiles from CBs to SFPU registers.
     for (size_t i = 0; i < incoming_connections.size(); i++) {
         auto port = kernel->get_input_port(incoming_connections[incoming_connections.size() - i - 1].dest.port);
+        // auto port = kernel->get_input_port(incoming_connections[i].dest.port);
         /**
         * Copies a single tile from the specified input CB and writes the result to
         * DST at a specified index. The function will employ unpacker to first unpack into SRC
@@ -587,7 +586,15 @@ void Map::generate_compute_device_kernel(
         * | dst_tile_index | The index of the tile in the DST register         | uint32_t  | Must be less than the size of the DST register (16) | Yes      |
         * */
         cs << "        copy_tile(" << port.name << ", 0, " << incoming_connections.size() - i - 1 << ");\n";
+        // cs << "        UNPACK(( llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(" << port.name << ", 0)  ));\n";
     }
+
+    // for (size_t i = 0; i < incoming_connections.size(); i++) {
+    //     auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+    //     cs << "        MATH(( llk_math_eltwise_unary_datacopy<A2D, BroadcastType::NONE, DST_ACCUM_MODE, UnpackToDestEn>(" << i << ", " << port.name << ") ));\n";
+    // }
+
+
     cs << "\n";
     cs << "        tile_regs_acquire();\n";
     cs << "        MATH((sfpi::compute()));\n";

@@ -162,12 +162,12 @@ int main(int argc, char **argv) {
     // Define ports and set compute kernel.
     saxpy_kernel.add_input_port("in0", tt::DataFormat::Float16_b);
     saxpy_kernel.add_input_port("in1", tt::DataFormat::Float16_b);
-    saxpy_kernel.add_input_port("in2", tt::DataFormat::Float16_b);
+    // saxpy_kernel.add_input_port("in2", tt::DataFormat::Float16_b);
     saxpy_kernel.add_output_port("out0", tt::DataFormat::Float16_b);
     // Every implicitly has the input variable "inN" and result needs to be assigned to "outN".
     // The type of N is the index of the port.
     saxpy_kernel.set_compute_kernel(R"(
-        out0 = in2;
+        out0 = in0 + in1;
     )");
 
     // Define streams.
@@ -177,10 +177,9 @@ int main(int argc, char **argv) {
     current::Stream sink(output_data, count, tt::DataFormat::Float16_b);
 
     // Define connections between streams and kernels.
-    current::Map map({&saxpy_kernel}, {&source0, &source1, &source2, &sink});
+    current::Map map({&saxpy_kernel}, {&source0, &source1, &sink});
     map.add_connection(&source0, &saxpy_kernel, "in0");
     map.add_connection(&source1, &saxpy_kernel, "in1");
-    map.add_connection(&source2, &saxpy_kernel, "in2");
     map.add_connection(&saxpy_kernel, "out0", &sink);
     map.export_dot("stream_graph.dot");
     map.generate_device_kernels();
