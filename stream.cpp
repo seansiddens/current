@@ -169,26 +169,26 @@ void Map::execute() {
         for (size_t i = 0; i < incoming_connections.size(); i++) {
             // Each port is typed with a specific data format. 
             auto cb_index = i + IN_CB_START;
-            auto port_index = incoming_connections[i].dest.index;
-            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(kernel->input_ports[port_index].data_format);
-            auto port = kernel->input_ports[port_index];
+            auto input_port = kernel->get_input_port(incoming_connections[i].dest.port);
+            auto input_port_index = kernel->get_input_port_index(input_port.name);
+            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(input_port.data_format);
             tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
                 TILES_PER_CB * tile_size_bytes,
-                {{cb_index, port.data_format}}
+                {{cb_index, input_port.data_format}}
             ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
-            kernel->input_ports[port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
+            kernel->input_ports[input_port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
         }
 
         for (size_t i = 0; i < outgoing_connections.size(); i++) {
             auto cb_index = i + OUT_CB_START;
-            auto port_index = outgoing_connections[i].source.index;
-            auto port = kernel->output_ports[port_index];
-            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(port.data_format);
+            auto output_port = kernel->get_output_port(outgoing_connections[i].source.port);
+            auto output_port_index = kernel->get_output_port_index(output_port.name);
+            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(output_port.data_format);
             tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
                 TILES_PER_CB * tile_size_bytes,
-                {{cb_index, port.data_format}}
+                {{cb_index, output_port.data_format}}
             ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
-            kernel->output_ports[port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
+            kernel->output_ports[output_port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
         }
 
         // Create device kernels.
@@ -743,6 +743,8 @@ void Map::generate_writer_device_kernel(
     std::stringstream ws;
     // Includes.
     ws << "#include <cstdint>\n";
+    ws << "#include \"hostdevcommon/common_values.hpp\"\n";
+    ws << "#include \"dataflow_api.h\"\n";
     ws << "\n";
 
     // Main 
@@ -774,6 +776,27 @@ void Map::generate_writer_device_kernel(
             ws << "    };\n\n";
         } else {
             // TODO: Handle outgoing kernel connections.
+            auto port = kernel->get_output_port(connection.source.port);
+            ws << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
+            total_args++;
+            ws << "    uint32_t " << port.name << "_receiver_noc_x = get_arg_val<uint32_t>(" << total_args << ");\n";
+            total_args++;
+            ws << "    uint32_t " << port.name << "_receiver_noc_y = get_arg_val<uint32_t>(" << total_args << ");\n";
+            total_args++;
+            ws << "    uint32_t " << port.name << "_sender_semaphore_addr = get_semaphore(get_arg_val<uint32_t>(" << total_args << "));\n";
+            total_args++;
+            ws << "    uint32_t " << port.name << "_receiver_semaphore_addr = get_semaphore(get_arg_val<uint32_t>(" << total_args << "));\n";
+            total_args++;
+            ws << "    uint32_t " << port.name << "_l1_valid_value_addr = get_semaphore(get_arg_val<uint32_t>(" << total_args << "));\n";
+            total_args++;
+            ws << "\n";
+
+            // Initialized to zero by host before program launch.
+            ws << "    volatile tt_l1_ptr uint32_t* " << port.name << "_sender_semaphore_addr_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(" << port.name << "_sender_semaphore_addr);\n";
+            // Local valid value in L1.
+            ws << "    volatile tt_l1_ptr uint32_t* " << port.name << "_l1_valid_value_addr_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(" << port.name << "_l1_valid_value_addr);\n";
+            ws << "    *(" << port.name << "_l1_valid_value_addr_ptr) = VALID;\n";
+            ws << "\n";
         }
     }
 
@@ -787,6 +810,15 @@ void Map::generate_writer_device_kernel(
     }
     ws << "\n";
 
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto connection = outgoing_connections[i];
+        if (connection.dest.is_stream()) {
+            continue;
+        }
+        auto port = kernel->get_output_port(outgoing_connections[i].source.port);
+        ws << "    uint64_t " << port.name << "_receiver_semaphore_noc_addr = get_noc_addr(" << port.name << "_receiver_noc_x, " << port.name << "_receiver_noc_y, " << port.name << "_receiver_semaphore_addr);\n";
+    }
+    ws << "\n";
     // Output tile stream loop.
     // TODO: Handle multiple output ports with DIFFERENT n_tiles.
     // In the loop, need to keep track of how many tiles we've written to each output port.
@@ -794,12 +826,20 @@ void Map::generate_writer_device_kernel(
     ws << "    for(uint32_t i = 0; i < " << outgoing_connections[0].source.port << "_ntiles; i++) {\n";
     // Wait tiles to arrive in CBs
     for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto connection = outgoing_connections[i];
+        if (!connection.dest.is_stream()) {
+            continue;
+        }
         auto port = kernel->get_output_port(outgoing_connections[i].source.port);
         ws << "        cb_wait_front(" << port.name << ", 1);\n";
     }
 
     // Write tiles to DRAM.
     for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto connection = outgoing_connections[i];
+        if (!connection.dest.is_stream()) {
+            continue;
+        }
         auto port = kernel->get_output_port(outgoing_connections[i].source.port);
         ws << "        uint32_t " << port.name << "_read_ptr = get_read_ptr(" << port.name << ");\n";
         ws << "        noc_async_write_tile(i, " << port.name << "_addr_gen, " << port.name << "_read_ptr);\n";
@@ -813,9 +853,53 @@ void Map::generate_writer_device_kernel(
 
     // Mark the tiles as consumed.
     for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto connection = outgoing_connections[i];
+        if (!connection.dest.is_stream()) {
+            continue;
+        }
         auto port = kernel->get_output_port(outgoing_connections[i].source.port);
         ws << "        cb_pop_front(" << port.name << ", 1);\n";
     }
+
+    // Handle producer-consumer pattern.
+    for (size_t i = 0; i < outgoing_connections.size(); i++) {
+        auto connection = outgoing_connections[i];
+        if (connection.dest.is_stream()) {
+            continue;
+        }
+        // This kernel's port that we are sending out of.
+        auto sender_port = kernel->get_output_port(outgoing_connections[i].source.port);
+
+        // The input port of the kernel we are sending to.
+        auto receiver_port = kernel->get_input_port(outgoing_connections[i].dest.port);
+        // Wait until receiver has set the sender's semaphore to 1, which means receiver has reserved space in their CB.
+        ws << "        noc_semaphore_wait(" << sender_port.name << "_sender_semaphore_addr_ptr, 1);\n";
+
+        // Wait for data to be ready to be sent.
+        ws << "        cb_wait_front(" << sender_port.name << ", 1);\n";
+        ws << "        uint32_t " << sender_port.name << "_read_ptr = get_read_ptr(" << sender_port.name << ");\n";
+
+        // We have the data ready to be sent (at l1_addr), we can send it to the receiver.
+        // We need to get a read_ptr to the CB that will be used by the receiver.
+        // TODO: Need to figure out how to do this. RN I'm just going to assume the receiver is using in0 CB.
+        // This might assume that the CBs are set up in the same exact way on both tiles?
+        ws << "        uint32_t " << sender_port.name << "_receiver_read_ptr = get_read_ptr(0);\n";
+        ws << "        uint64_t " << sender_port.name << "_receiver_noc_addr = get_noc_addr(" << sender_port.name << "_receiver_noc_x, " << sender_port.name << "_receiver_noc_y, " << sender_port.name << "_receiver_read_ptr);\n";
+        // TODO: Don't hardcode the tile size, use elment size of stream data.
+        ws << "        noc_async_write(" << sender_port.name << "_read_ptr, " << sender_port.name << "_receiver_noc_addr, " << TILE_WIDTH * TILE_HEIGHT * 2 << ");\n";
+
+        // Set the sender's semaphore back to 0 for the next block.
+        ws << "        noc_semaphore_set(" << sender_port.name << "_sender_semaphore_addr_ptr, 0);\n";
+
+        // Set the receiver's semaphore so that it knows that data has been written to the CB
+        // must use noc_semaphore_set_remote and not noc_semaphore_inc in the sender
+        // because we need to ensure that data is written to the remote CB before we set the semaphore
+        // noc_async_write and noc_semaphore_set_remote are ordered
+        ws << "        noc_semaphore_set_remote(" << sender_port.name << "_l1_valid_value_addr, " << sender_port.name << "_receiver_semaphore_noc_addr);\n";
+
+        ws << "        cb_pop_front(" << sender_port.name << ", 1);\n";
+    }
+
     ws << "    }\n";
     // End tile stream loop.
 

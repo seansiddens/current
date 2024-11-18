@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
     map.export_dot("stream_graph.dot");
     map.generate_device_kernels();
     map.check_connections();
-    // map.execute();
+    map.execute();
 
     return 0;
 }
