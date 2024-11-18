@@ -15,3 +15,5 @@ constexpr uint32_t IN_CB_START = 0;
 constexpr uint32_t OUT_CB_START = 16;
 constexpr uint32_t MAX_INPUT_PORTS = 16;
 constexpr uint32_t MAX_OUTPUT_PORTS = 16;
+// constexpr uint32_t INVALID = 0;
+// constexpr uint32_t VALID = 1;

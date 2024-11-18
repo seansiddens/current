@@ -108,7 +108,7 @@ class Kernel {
     // the pipelining.
     std::vector<Port> input_ports;
     std::vector<Port> output_ports;
-    CoreSpec core_spec; // Where this kernel will be placed.
+    CoreCoord core_spec; // Where this kernel will be placed.
     tt_metal::KernelHandle reader_kernel;
     tt_metal::KernelHandle compute_kernel;
     tt_metal::KernelHandle writer_kernel;
@@ -116,6 +116,13 @@ class Kernel {
     std::filesystem::path generated_compute_kernel_path;
     std::filesystem::path generated_writer_kernel_path;
     std::string sfpi_kernel_string;
+    // TODO: This only allows for one sender and receiver per kernel.
+    // Eventually would want to support multiple senders and receivers per kernel
+    // e.g when we have multiple output ports, each participatnig in producer/consumer.
+    // Or if we have single producer and multiple consumers (and vice versa).
+    uint32_t sender_semaphore_id;
+    uint32_t receiver_semaphore_id;
+    uint32_t l1_valid_value_semaphore_id;
 };
 
 class Map {
@@ -162,6 +169,7 @@ class Map {
     struct Connection {
         Endpoint source;
         Endpoint dest;
+        uint32_t n_tiles;
     };
 
     Runtime runtime;

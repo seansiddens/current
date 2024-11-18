@@ -157,18 +157,19 @@ int main(int argc, char **argv) {
     // CBHandle cb_out = MakeCircularBufferBFP16(program, core_set, tt::CB::c_out0, tiles_per_cb);
 
     // Kernel generation.
-    current::Kernel saxpy_kernel;
+    current::Kernel kernel_a;
+    current::Kernel kernel_b;
 
     // Define ports and set compute kernel.
-    saxpy_kernel.add_input_port("in0", tt::DataFormat::Float16_b);
-    saxpy_kernel.add_input_port("in1", tt::DataFormat::Float16_b);
-    // saxpy_kernel.add_input_port("in2", tt::DataFormat::Float16_b);
-    saxpy_kernel.add_output_port("out0", tt::DataFormat::Float16_b);
+    kernel_a.add_input_port("in0", tt::DataFormat::Float16_b);
+    kernel_a.add_output_port("out0", tt::DataFormat::Float16_b);
+    kernel_b.add_input_port("in0", tt::DataFormat::Float16_b);
+    kernel_b.add_output_port("out0", tt::DataFormat::Float16_b);
     // Every implicitly has the input variable "inN" and result needs to be assigned to "outN".
     // The type of N is the index of the port.
-    saxpy_kernel.set_compute_kernel(R"(
-        out0 = in0 + in1;
-    )");
+    // saxpy_kernel.set_compute_kernel(R"(
+    //     out0 = in0 + in1;
+    // )");
 
     // Define streams.
     current::Stream source0(generator0_data, count, tt::DataFormat::Float16_b);
@@ -177,14 +178,14 @@ int main(int argc, char **argv) {
     current::Stream sink(output_data, count, tt::DataFormat::Float16_b);
 
     // Define connections between streams and kernels.
-    current::Map map({&saxpy_kernel}, {&source0, &source1, &sink});
-    map.add_connection(&source0, &saxpy_kernel, "in0");
-    map.add_connection(&source1, &saxpy_kernel, "in1");
-    map.add_connection(&saxpy_kernel, "out0", &sink);
+    current::Map map({&kernel_a, &kernel_b}, {&source0, &sink});
+    map.add_connection(&source0, &kernel_a, "in0");
+    map.add_connection(&kernel_a, "out0", &kernel_b, "in0");
+    map.add_connection(&kernel_b, "out0", &sink);
     map.export_dot("stream_graph.dot");
     map.generate_device_kernels();
     map.check_connections();
-    map.execute();
+    // map.execute();
 
     return 0;
 }
