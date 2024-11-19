@@ -554,6 +554,7 @@ void Map::generate_compute_device_kernel(
     cs << "#include \"compute_kernel_api/eltwise_binary.h\"\n";
     cs << "#include \"compute_kernel_api/eltwise_unary/eltwise_unary.h\"\n";
     cs << "#include \"compute_kernel_api.h\"\n";
+    cs << "#include \"cmath_common.h\"\n";
     cs << "#include \"sfpi.h\"\n";
     // cs << "#include \"debug/dprint.h\"\n";
     cs << "\n";
@@ -562,6 +563,8 @@ void Map::generate_compute_device_kernel(
     cs << "namespace sfpi {\n";
     // cs << "template< int ITERATIONS = 16 >\n";
     cs << "sfpi_inline void compute() {\n";
+    // Set destination write address.
+    cs << "    math::set_dst_write_addr<DstTileLayout::Default, DstTileShape::Tile32x32>(0);\n";
     // If we don't have a specifed compute kernel, don't generate anything.
     if (!kernel->sfpi_kernel_string.empty()) {
         // TODO: Do a better optimization if we don't have a compute kernel.
@@ -634,6 +637,7 @@ void Map::generate_compute_device_kernel(
         cs << "    init_sfpu(" << port.name << ");\n";
     }
     cs << "\n";
+    // cs << "    copy_tile_init();\n";
 
     // Tile stream loop
     // TODO: Right now just going to assume that all streams have the same number of tiles.
@@ -646,9 +650,10 @@ void Map::generate_compute_device_kernel(
     cs << "\n";
 
     // Copy tiles from CBs to SFPU registers.
+    cs << "        tile_regs_acquire();\n";
     for (size_t i = 0; i < incoming_connections.size(); i++) {
-        auto port = kernel->get_input_port(incoming_connections[incoming_connections.size() - i - 1].dest.port);
-        // auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+        // auto port = kernel->get_input_port(incoming_connections[incoming_connections.size() - i - 1].dest.port);
+        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
         /**
         * Copies a single tile from the specified input CB and writes the result to
         * DST at a specified index. The function will employ unpacker to first unpack into SRC
@@ -668,7 +673,8 @@ void Map::generate_compute_device_kernel(
         * | in_tile_index  | The index of the tile to copy from the input CB   | uint32_t  | Must be less than the size of the CB                | Yes      |
         * | dst_tile_index | The index of the tile in the DST register         | uint32_t  | Must be less than the size of the DST register (16) | Yes      |
         * */
-        cs << "        copy_tile(" << port.name << ", 0, " << incoming_connections.size() - i - 1 << ");\n";
+        // cs << "        copy_tile(" << port.name << ", 0, " << incoming_connections.size() - i - 1 << ");\n";
+        cs << "        copy_tile(" << port.name << ", 0, " << i << ");\n";
         // cs << "        UNPACK(( llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(" << port.name << ", 0)  ));\n";
     }
 
@@ -679,7 +685,7 @@ void Map::generate_compute_device_kernel(
 
 
     cs << "\n";
-    cs << "        tile_regs_acquire();\n";
+    // cs << "        tile_regs_acquire();\n";
     cs << "        MATH((sfpi::compute()));\n";
     cs << "        tile_regs_commit();\n";
     cs << "\n";

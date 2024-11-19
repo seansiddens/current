@@ -162,13 +162,18 @@ int main(int argc, char **argv) {
 
     // Define ports and set compute kernel.
     kernel_a.add_input_port("in0", tt::DataFormat::Float16_b);
+    kernel_a.add_input_port("in1", tt::DataFormat::Float16_b);
+    kernel_a.add_input_port("in2", tt::DataFormat::Float16_b);
     kernel_a.add_output_port("out0", tt::DataFormat::Float16_b);
     kernel_b.add_input_port("in0", tt::DataFormat::Float16_b);
     kernel_b.add_output_port("out0", tt::DataFormat::Float16_b);
     // Every implicitly has the input variable "inN" and result needs to be assigned to "outN".
     // The type of N is the index of the port.
-    // saxpy_kernel.set_compute_kernel(R"(
-    //     out0 = in0 + in1;
+    kernel_a.set_compute_kernel(R"(
+        out0 = in0 + in1 * in2;
+    )");
+    // kernel_b.set_compute_kernel(R"(
+    //     out0 = in0;
     // )");
 
     // Define streams.
@@ -178,10 +183,14 @@ int main(int argc, char **argv) {
     current::Stream sink(output_data, count, tt::DataFormat::Float16_b);
 
     // Define connections between streams and kernels.
-    current::Map map({&kernel_a, &kernel_b}, {&source0, &sink});
+    // TODO: Segfaults if we add an extra kernel and don't connect it to anything.
+    current::Map map({&kernel_a}, {&source0, &source1, &source2, &sink});
     map.add_connection(&source0, &kernel_a, "in0");
-    map.add_connection(&kernel_a, "out0", &kernel_b, "in0");
-    map.add_connection(&kernel_b, "out0", &sink);
+    map.add_connection(&source1, &kernel_a, "in1");
+    map.add_connection(&source2, &kernel_a, "in2");
+    map.add_connection(&kernel_a, "out0", &sink);
+    // map.add_connection(&kernel_a, "out0", &kernel_b, "in0");
+    // map.add_connection(&kernel_b, "out0", &sink);
     map.export_dot("stream_graph.dot");
     map.generate_device_kernels();
     map.check_connections();
