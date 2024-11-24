@@ -128,12 +128,14 @@ class Kernel {
 class Map {
   public:
     Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams);
+    ~Map();
     void add_connection(Kernel *src, std::string src_out, Kernel *dst, std::string dst_in);
     void add_connection(Stream *src, Kernel *dst, std::string dst_in);
     void add_connection(Kernel *src, std::string src_out, Stream *dst);
     void execute();
     void generate_device_kernels();
     void check_connections();
+    std::vector<uint32_t> read_stream(Stream *stream);
 
     // Visualize the work graph.
     // For PNG

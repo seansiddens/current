@@ -248,7 +248,7 @@ void Map::execute() {
                 auto sender = kernels[connection.source.index];
                 // TODO: DON'T HARDCODE THIS. Need to somehow figure out how many tiles a reader/writer should have when reading/writing to a kernel.
                 // Somehow propagate this when defining connections from streams? w/o reduction, the # of tiles is just the capacity of the stream.
-                auto n_tiles = 2;
+                auto n_tiles = 16;
                 CoreCoord sender_core = sender->core_spec;
                 uint32_t sender_x = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).x;
                 uint32_t sender_y = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).y;
@@ -275,7 +275,7 @@ void Map::execute() {
                 writer_args.push_back(stream->device_buffer_address);
             } else {
                 // Outgoing connection is another kernel.
-                auto n_tiles = 2; // TODO: DONT HARDCODE THIS!!!!!!!
+                auto n_tiles = 16; // TODO: DONT HARDCODE THIS!!!!!!!
                 auto receiver = kernels[connection.dest.index];
                 CoreCoord receiver_core = receiver->core_spec;
                 uint32_t receiver_x = (uint32_t)runtime.device->worker_core_from_logical_core(receiver_core).x;
@@ -295,18 +295,10 @@ void Map::execute() {
     tt_metal::Finish(runtime.device->command_queue());
     tt::log_info("[CURRENT] Program execution completed!");
 
-    // Read output from sink buffer.
-    // TODO: Right now we just hard-code this to the last stream, but need to figure out what streams we want to read from. 
-    // Could copy ALL streams's data back to their host buffer, then let the user decide which ones to read from via a Stream method.
-    std::vector<uint32_t> out;
-    tt_metal::EnqueueReadBuffer(runtime.device->command_queue(), streams[streams.size() - 1]->device_buffer, out, true);
+    // tt_metal::CloseDevice(runtime.device);
+}
 
-    std::vector<bfloat16> output_data = unpack_uint32_vec_into_bfloat16_vec(out);
-    for (uint32_t i = 0; i < output_data.size(); i++) {
-        std::cout << i << ": " << output_data[i].to_float() << "\n";
-    }
-    std::cout << std::endl;
-
+Map::~Map() {
     tt_metal::CloseDevice(runtime.device);
 }
 
@@ -375,6 +367,7 @@ void Map::generate_reader_device_kernel(
     rs << "#include \"dataflow_api.h\"\n";
     rs << "#include \"debug/dprint.h\"\n";
     rs << "#include \"hostdevcommon/common_values.hpp\"\n";
+    rs << "#include \"debug/dprint.h\"\n";
     rs << "void kernel_main() {\n";
 
     // Reader params from kernel args
@@ -388,9 +381,11 @@ void Map::generate_reader_device_kernel(
             // Stream -> Kernel, get the input port index.
             auto port = kernel->get_input_port(connection.dest.port);
             rs << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
+            rs << "    DPRINT << \"READER0: " << port.name << "_ntiles: \" << " << port.name << "_ntiles << ENDL();\n";
             total_args++;
             // For every incoming stream connection, we need to get it's address and create an address generator.
             rs << "    uint32_t " << port.name << "_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
+            rs << "    DPRINT << \"READER0: " << port.name << "_addr: \" << " << port.name << "_addr << ENDL();\n";
             total_args++;
             // Address generator.
             // TODO: Do we need this? How does this even work?
@@ -402,20 +397,26 @@ void Map::generate_reader_device_kernel(
         } else {
             auto port = kernel->get_input_port(connection.dest.port);
             rs << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
+            rs << "    DPRINT << \"READER1: " << port.name << "_ntiles: \" << " << port.name << "_ntiles << ENDL();\n";
             total_args++;
             rs << "    uint32_t " << port.name << "_sender_noc_x = get_arg_val<uint32_t>(" << total_args << ");\n";
+            rs << "    DPRINT << \"READER1: " << port.name << "_sender_noc_x: \" << " << port.name << "_sender_noc_x << ENDL();\n";
             total_args++;
             rs << "    uint32_t " << port.name << "_sender_noc_y = get_arg_val<uint32_t>(" << total_args << ");\n";
+            rs << "    DPRINT << \"READER1: " << port.name << "_sender_noc_y: \" << " << port.name << "_sender_noc_y << ENDL();\n";
             total_args++;
             rs << "    uint32_t " << port.name << "_sender_semaphore_addr = get_semaphore(get_arg_val<uint32_t>(" << total_args << "));\n";
+            rs << "    DPRINT << \"READER1: " << port.name << "_sender_semaphore_addr: \" << " << port.name << "_sender_semaphore_addr << ENDL();\n";
             total_args++;
             rs << "    uint32_t " << port.name << "_receiver_semaphore_addr = get_semaphore(get_arg_val<uint32_t>(" << total_args << "));\n";
+            rs << "    DPRINT << \"READER1: " << port.name << "_receiver_semaphore_addr: \" << " << port.name << "_receiver_semaphore_addr << ENDL();\n";
             total_args++;
             // rs << "    uint32_t " << port.name << "_l1_valid_value_semaphore_id = get_arg_val<uint32_t>(" << total_args << ");\n";
             // total_args++;
 
             rs << "    volatile tt_l1_ptr uint32_t* " << port.name << "_receiver_semaphore_addr_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(" << port.name << "_receiver_semaphore_addr);\n";
-            rs << "    uint32_t " << port.name << "_sender_semaphore_noc_addr = get_noc_addr(" << port.name << "_sender_noc_x, " << port.name << "_sender_noc_y, " << port.name << "_sender_semaphore_addr);\n";
+            rs << "    uint64_t " << port.name << "_sender_semaphore_noc_addr = get_noc_addr(" << port.name << "_sender_noc_x, " << port.name << "_sender_noc_y, " << port.name << "_sender_semaphore_addr);\n";
+            rs << "    DPRINT << \"READER1: " << port.name << "_sender_semaphore_noc_addr: \" << " << port.name << "_sender_semaphore_noc_addr << ENDL();\n";
             rs << "\n";
         }
     }
@@ -509,14 +510,19 @@ void Map::generate_reader_device_kernel(
             }
             auto port = kernel->get_input_port(incoming_connections[i].dest.port);
             // Wait for space in CB.
+            rs << "        DPRINT << \"READER1: Waiting for space in CB " << port.name << "\" << ENDL();\n";
             rs << "        cb_reserve_back(" << port.name << ", 1);\n";
             // Reset receiver's own semaphore value to INVALID.
             rs << "        noc_semaphore_set(" << port.name << "_receiver_semaphore_addr_ptr, INVALID);\n";
             // Tell sender we're ready -- atomic increment sender's semaphore.
+            rs << "        DPRINT << \"READER1: Telling sender we're ready\" << ENDL();\n";
             rs << "        noc_semaphore_inc(" << port.name << "_sender_semaphore_noc_addr, 1);\n";
             // Wait on receiver's own semaphore value to become VALID (set by sender after it sends the data).
+            rs << "        DPRINT << \"READER1: Waiting on receiver's semaphore\" << ENDL();\n";
             rs << "        noc_semaphore_wait(" << port.name << "_receiver_semaphore_addr_ptr, VALID);\n";
+            rs << "        DPRINT << \"READER1: Receiver's semaphore is VALID!\" << ENDL();\n";
             // Push tile into CB.
+            rs << "        DPRINT << \"READER1: Pushing tile into CB\" << ENDL();\n";
             rs << "        cb_push_back(" << port.name << ", 1);\n";
             // Increment counter.
             rs << "        " << port.name << "_count++;\n";
@@ -556,7 +562,7 @@ void Map::generate_compute_device_kernel(
     cs << "#include \"compute_kernel_api.h\"\n";
     cs << "#include \"cmath_common.h\"\n";
     cs << "#include \"sfpi.h\"\n";
-    // cs << "#include \"debug/dprint.h\"\n";
+    cs << "#include \"debug/dprint.h\"\n";
     cs << "\n";
 
     // SFPU computation
@@ -723,6 +729,7 @@ void Map::generate_compute_device_kernel(
 
     // End tile stream loop.
     cs << "    }\n";
+    cs << "    DPRINT << \"COMPUTE0: Done\" << ENDL();\n";
 
     // End main.
     cs << "}\n";
@@ -751,6 +758,7 @@ void Map::generate_writer_device_kernel(
     ws << "#include <cstdint>\n";
     ws << "#include \"hostdevcommon/common_values.hpp\"\n";
     ws << "#include \"dataflow_api.h\"\n";
+    ws << "#include \"debug/dprint.h\"\n";
     ws << "\n";
 
     // Main 
@@ -784,16 +792,22 @@ void Map::generate_writer_device_kernel(
             // TODO: Handle outgoing kernel connections.
             auto port = kernel->get_output_port(connection.source.port);
             ws << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
+            ws << "    DPRINT << \"WRITER0: " << port.name << "_ntiles: \" << " << port.name << "_ntiles << ENDL();\n";
             total_args++;
             ws << "    uint32_t " << port.name << "_receiver_noc_x = get_arg_val<uint32_t>(" << total_args << ");\n";
+            ws << "    DPRINT << \"WRITER0: " << port.name << "_receiver_noc_x: \" << " << port.name << "_receiver_noc_x << ENDL();\n";
             total_args++;
             ws << "    uint32_t " << port.name << "_receiver_noc_y = get_arg_val<uint32_t>(" << total_args << ");\n";
+            ws << "    DPRINT << \"WRITER0: " << port.name << "_receiver_noc_y: \" << " << port.name << "_receiver_noc_y << ENDL();\n";
             total_args++;
             ws << "    uint32_t " << port.name << "_sender_semaphore_addr = get_semaphore(get_arg_val<uint32_t>(" << total_args << "));\n";
+            ws << "    DPRINT << \"WRITER0: " << port.name << "_sender_semaphore_addr: \" << " << port.name << "_sender_semaphore_addr << ENDL();\n";
             total_args++;
             ws << "    uint32_t " << port.name << "_receiver_semaphore_addr = get_semaphore(get_arg_val<uint32_t>(" << total_args << "));\n";
+            ws << "    DPRINT << \"WRITER0: " << port.name << "_receiver_semaphore_addr: \" << " << port.name << "_receiver_semaphore_addr << ENDL();\n";
             total_args++;
             ws << "    uint32_t " << port.name << "_l1_valid_value_addr = get_semaphore(get_arg_val<uint32_t>(" << total_args << "));\n";
+            ws << "    DPRINT << \"WRITER0: " << port.name << "_l1_valid_value_addr: \" << " << port.name << "_l1_valid_value_addr << ENDL();\n";
             total_args++;
             ws << "\n";
 
@@ -823,6 +837,7 @@ void Map::generate_writer_device_kernel(
         }
         auto port = kernel->get_output_port(outgoing_connections[i].source.port);
         ws << "    uint64_t " << port.name << "_receiver_semaphore_noc_addr = get_noc_addr(" << port.name << "_receiver_noc_x, " << port.name << "_receiver_noc_y, " << port.name << "_receiver_semaphore_addr);\n";
+        ws << "    DPRINT << \"WRITER0: " << port.name << "_receiver_semaphore_noc_addr: \" << " << port.name << "_receiver_semaphore_noc_addr << ENDL();\n";
     }
     ws << "\n";
     // Output tile stream loop.
@@ -837,6 +852,7 @@ void Map::generate_writer_device_kernel(
             continue;
         }
         auto port = kernel->get_output_port(outgoing_connections[i].source.port);
+        ws << "        DPRINT << \"WRITER0: Waiting for tile in CB " << port.name << "\" << ENDL();\n";
         ws << "        cb_wait_front(" << port.name << ", 1);\n";
     }
 
@@ -879,9 +895,11 @@ void Map::generate_writer_device_kernel(
         // The input port of the kernel we are sending to.
         auto receiver_port = kernel->get_input_port(outgoing_connections[i].dest.port);
         // Wait until receiver has set the sender's semaphore to 1, which means receiver has reserved space in their CB.
+        ws << "        DPRINT << \"WRITER0: Waiting for sender's semaphore to be set to 1\" << ENDL();\n";
         ws << "        noc_semaphore_wait(" << sender_port.name << "_sender_semaphore_addr_ptr, 1);\n";
 
         // Wait for data to be ready to be sent.
+        ws << "        DPRINT << \"WRITER0: Waiting for data to be ready to be sent from CB\" << ENDL();\n";
         ws << "        cb_wait_front(" << sender_port.name << ", 1);\n";
         ws << "        uint32_t " << sender_port.name << "_read_ptr = get_read_ptr(" << sender_port.name << ");\n";
 
@@ -891,22 +909,28 @@ void Map::generate_writer_device_kernel(
         // This might assume that the CBs are set up in the same exact way on both tiles?
         ws << "        uint32_t " << sender_port.name << "_receiver_read_ptr = get_read_ptr(0);\n";
         ws << "        uint64_t " << sender_port.name << "_receiver_noc_addr = get_noc_addr(" << sender_port.name << "_receiver_noc_x, " << sender_port.name << "_receiver_noc_y, " << sender_port.name << "_receiver_read_ptr);\n";
+        ws << "        DPRINT << \"WRITER0: " << sender_port.name << "_receiver_noc_addr: \" << " << sender_port.name << "_receiver_noc_addr << ENDL();\n";
         // TODO: Don't hardcode the tile size, use elment size of stream data.
         ws << "        noc_async_write(" << sender_port.name << "_read_ptr, " << sender_port.name << "_receiver_noc_addr, " << TILE_WIDTH * TILE_HEIGHT * 2 << ");\n";
+        ws << "        DPRINT << \"WRITER0: Writing to receiver's CB\" << ENDL();\n";
 
         // Set the sender's semaphore back to 0 for the next block.
         ws << "        noc_semaphore_set(" << sender_port.name << "_sender_semaphore_addr_ptr, 0);\n";
+        ws << "        DPRINT << \"WRITER0: Set sender's semaphore back to 0\" << ENDL();\n";
 
         // Set the receiver's semaphore so that it knows that data has been written to the CB
         // must use noc_semaphore_set_remote and not noc_semaphore_inc in the sender
         // because we need to ensure that data is written to the remote CB before we set the semaphore
         // noc_async_write and noc_semaphore_set_remote are ordered
         ws << "        noc_semaphore_set_remote(" << sender_port.name << "_l1_valid_value_addr, " << sender_port.name << "_receiver_semaphore_noc_addr);\n";
+        ws << "        DPRINT << \"WRITER0: Set receiver's semaphore to VALID\" << ENDL();\n";
 
         ws << "        cb_pop_front(" << sender_port.name << ", 1);\n";
+        ws << "        DPRINT << \"WRITER0: Popped front of CB " << sender_port.name << "\" << ENDL();\n";
     }
 
     ws << "    }\n";
+    ws << "    DPRINT << \"WRITER0: Done\" << ENDL();\n";
     // End tile stream loop.
 
     //End Main
@@ -1038,6 +1062,25 @@ void Map::check_connections() {
     }
 
     assert(!flag && "Missing connections in map!");
+}
+
+std::vector<uint32_t> Map::read_stream(Stream *stream) {
+    auto it = std::find(streams.begin(), streams.end(), stream);
+    assert(it != streams.end() && "Stream not found in map!");
+
+     // Verify this stream is actually a destination in our connections
+    bool is_output = false;
+    for (const auto& conn : connections) {
+        if (conn.dest.is_stream() && streams[conn.dest.index] == stream) {
+            is_output = true;
+            break;
+        }
+    }
+    assert(is_output && "Cannot get output from a stream that isn't a destination!");
+
+    std::vector<uint32_t> out;
+    tt_metal::EnqueueReadBuffer(runtime.device->command_queue(), stream->device_buffer, out, true);
+    return out;
 }
 
 } // End namespace current
