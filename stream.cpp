@@ -97,6 +97,7 @@ void Map::add_connection(Kernel *src, std::string src_out, Stream *dst) {
 
 void Map::execute() {
     check_connections();
+    propagate_counts();
 
     // 1. Create device and program.
     runtime.device = tt_metal::CreateDevice(0);
@@ -177,6 +178,17 @@ void Map::execute() {
                 {{cb_index, input_port.data_format}}
             ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
             kernel->input_ports[input_port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
+
+            // // Create mailbox buffer for incoming connections from another kernel.
+            // if (incoming_connections[i].source.is_kernel()) {
+            //     auto mailbox_config = tt_metal::InterleavedBufferConfig{
+            //         .device = runtime.device,
+            //         .size = tile_size_bytes,
+            //         .page_size = tile_size_bytes,
+            //         .buffer_type = tt_metal::BufferType::L1
+            //     };
+            //     kernel->input_ports[input_port_index].mailbox = tt_metal::CreateBuffer(mailbox_config);
+            // }
         }
 
         for (size_t i = 0; i < outgoing_connections.size(); i++) {
@@ -237,18 +249,16 @@ void Map::execute() {
         std::vector<uint32_t> reader_args;
         std::vector<uint32_t> compute_args;
         for (const auto& connection : incoming_connections) {
+            auto n_tiles = connection.n_tiles;
             if (connection.source.is_stream()) {
                 // For every incoming stream connection, we need to know how many tiles we expect to read and what the DRAM address is.
                 auto stream = streams[connection.source.index];
-                reader_args.push_back(stream->n_tiles);
+                reader_args.push_back(n_tiles);
                 reader_args.push_back(stream->device_buffer_address);
-                compute_args.push_back(stream->n_tiles); // Compute also needs to know how many tiles to read in.
+                compute_args.push_back(n_tiles); // Compute also needs to know how many tiles to read in.
             } else {
                 // Incoming connection is another kernel. 
                 auto sender = kernels[connection.source.index];
-                // TODO: DON'T HARDCODE THIS. Need to somehow figure out how many tiles a reader/writer should have when reading/writing to a kernel.
-                // Somehow propagate this when defining connections from streams? w/o reduction, the # of tiles is just the capacity of the stream.
-                auto n_tiles = 16;
                 CoreCoord sender_core = sender->core_spec;
                 uint32_t sender_x = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).x;
                 uint32_t sender_y = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).y;
@@ -266,23 +276,25 @@ void Map::execute() {
 
         std::vector<uint32_t> writer_args;
         for (const auto& connection : outgoing_connections) {
+            auto n_tiles = connection.n_tiles;
             if (connection.dest.is_stream()) {
                 // TODO: Here we are explicitly setting the # of tiles we expect to write to be the same as the capacity of the stream.
                 // This can get a bit tricky if the compute does any sort of reduction and the user does not correctly set the capacity.
                 // I think if reduction kernels get implemented then we need a way of automatically determining the # of tiles to write at each stage of the program.
                 auto stream = streams[connection.dest.index];
-                writer_args.push_back(stream->n_tiles);
+                writer_args.push_back(n_tiles);
                 writer_args.push_back(stream->device_buffer_address);
             } else {
                 // Outgoing connection is another kernel.
-                auto n_tiles = 16; // TODO: DONT HARDCODE THIS!!!!!!!
                 auto receiver = kernels[connection.dest.index];
                 CoreCoord receiver_core = receiver->core_spec;
                 uint32_t receiver_x = (uint32_t)runtime.device->worker_core_from_logical_core(receiver_core).x;
                 uint32_t receiver_y = (uint32_t)runtime.device->worker_core_from_logical_core(receiver_core).y;
+                uint32_t receiver_mailbox_addr = kernel->get_input_port(connection.dest.port).mailbox->address();
                 writer_args.push_back(n_tiles);
                 writer_args.push_back(receiver_x);
                 writer_args.push_back(receiver_y);
+                // writer_args.push_back(receiver_mailbox_addr);
                 writer_args.push_back(kernel->sender_semaphore_id);
                 writer_args.push_back(kernel->receiver_semaphore_id);
                 writer_args.push_back(kernel->l1_valid_value_semaphore_id);
@@ -1081,6 +1093,74 @@ std::vector<uint32_t> Map::read_stream(Stream *stream) {
     std::vector<uint32_t> out;
     tt_metal::EnqueueReadBuffer(runtime.device->command_queue(), stream->device_buffer, out, true);
     return out;
+}
+
+void Map::propagate_counts() {
+    // TODO: This assumes that all streams have the same tile count, and every kernel will input and output the same # of tiles.
+    //       This assumption no longer holds if kernels are able to do reduction operations. In this case, it should be possible to 
+    //       have differing input counts to the same kernel, and differing output counts from the same kernel.
+
+    // Initialize all connections with no count
+    for (auto& connection : connections) {
+        connection.n_tiles = 0;
+    }
+
+    // First pass: Set counts from source streams
+    for (size_t i = 0; i < connections.size(); i++) {
+        auto& connection = connections[i];
+        if (connection.source.is_stream()) {
+            auto stream = streams[connection.source.index];
+            connection.n_tiles = stream->n_tiles;
+        }
+    }
+
+    // Keep propagating until no changes are made
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        
+        // For each kernel
+        for (size_t kernel_idx = 0; kernel_idx < kernels.size(); kernel_idx++) {
+            // Find all incoming connections with counts
+            uint32_t incoming_count = 0;
+            bool has_incoming_count = false;
+            
+            for (const auto& conn : connections) {
+                if (conn.dest.is_kernel() && conn.dest.index == kernel_idx && conn.n_tiles > 0) {
+                    incoming_count = conn.n_tiles;
+                    has_incoming_count = true;
+                    break;
+                }
+            }
+
+            // If we found an incoming count, propagate to all connections for this kernel
+            if (has_incoming_count) {
+                for (auto& conn : connections) {
+                    // Update incoming connections that don't have counts
+                    if (conn.dest.is_kernel() && conn.dest.index == kernel_idx && conn.n_tiles == 0) {
+                        conn.n_tiles = incoming_count;
+                        changed = true;
+                    }
+                    // Update outgoing connections that don't have counts
+                    if (conn.source.is_kernel() && conn.source.index == kernel_idx && conn.n_tiles == 0) {
+                        conn.n_tiles = incoming_count;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Verify all connections have counts
+    for (const auto& connection : connections) {
+        if (connection.n_tiles == 0) {
+            tt::log_warning("[CURRENT] Connection from {} {} to {} {} has no tile count!",
+                connection.source.endpoint_type == Endpoint::EndpointType::Kernel ? "kernel" : "stream",
+                connection.source.index,
+                connection.dest.endpoint_type == Endpoint::EndpointType::Kernel ? "kernel" : "stream",
+                connection.dest.index);
+        }
+    }
 }
 
 } // End namespace current

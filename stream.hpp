@@ -53,6 +53,9 @@ class Kernel {
         std::string name;
         tt::DataFormat data_format;
         tt_metal::CBHandle cb; // TODO: Do we want ports to have ownership of CBs?
+        // L1 buffer for handling incoming mailbox messages.
+        // Only used for input ports whose incoming connections are another kernel.
+        std::shared_ptr<tt_metal::Buffer> mailbox; 
     };
 
     void add_input_port(const std::string& name, tt::DataFormat data_format);
@@ -207,6 +210,7 @@ class Map {
     void generate_compute_device_kernel(Kernel *kernel, std::vector<Connection> incoming_connections, std::vector<Connection> outgoing_connections);
     void generate_writer_device_kernel(Kernel *kernel, std::vector<Connection> outgoing_connections);
     bool has_incoming_connection(Kernel *kernel);
+    void propagate_counts();
 };
 
 } // End namespace current.
