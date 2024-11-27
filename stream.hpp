@@ -111,7 +111,7 @@ class Kernel {
     // the pipelining.
     std::vector<Port> input_ports;
     std::vector<Port> output_ports;
-    CoreCoord core_spec; // Where this kernel will be placed.
+    std::vector<CoreCoord> core_spec; // Where this kernel will be placed.
     tt_metal::KernelHandle reader_kernel;
     tt_metal::KernelHandle compute_kernel;
     tt_metal::KernelHandle writer_kernel;
@@ -139,6 +139,7 @@ class Map {
     void generate_device_kernels();
     void check_connections();
     std::vector<uint32_t> read_stream(Stream *stream);
+    void parallelize(std::vector<CoreCoord> &cores);
 
     // Visualize the work graph.
     // For PNG

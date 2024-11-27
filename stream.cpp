@@ -1,9 +1,9 @@
 #include "stream.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <fstream>
-#include <unordered_map>
 #include <vector>
 
 #include "common/bfloat16.hpp"
@@ -95,6 +95,14 @@ void Map::add_connection(Kernel *src, std::string src_out, Stream *dst) {
     add_connection(src_endpoint, dst_endpoint);
 }
 
+// void Map::parallelize(std::vector<CoreCoord> &cores) {
+//     auto total_cores = cores.size();
+
+//     for (size_t i = 0; i < kernels.size(); i++) {
+
+//     }
+// }
+
 void Map::execute() {
     check_connections();
     propagate_counts();
@@ -110,11 +118,11 @@ void Map::execute() {
     // 2. Core grid setup.
     // TODO: Have this configurable by user and dyanmic by runtime scheduling.
     // Write now just set to # of kernels we have.
-    runtime.num_cores = kernels.size();
+    // runtime.num_cores = kernels.size();
     auto compute_with_storage_grid_size = runtime.device->compute_with_storage_grid_size();
     runtime.num_cores_x = compute_with_storage_grid_size.x;
     runtime.num_cores_y = compute_with_storage_grid_size.y;
-    runtime.core_set = num_cores_to_corerange_set({0, 0}, runtime.num_cores, {runtime.num_cores_x, runtime.num_cores_y});
+    runtime.core_set = num_cores_to_corerange_set({0, 0}, kernels.size() * MAX_PARALLELIZATION_FACTOR, {runtime.num_cores_x, runtime.num_cores_y});
     tt::log_info("[CURRENT] num_cores_x: {}, num_cores_y: {}", runtime.num_cores_x, runtime.num_cores_y);
     tt::log_info("[CURRENT] core_set: {}", runtime.core_set);
     tt::log_info("[CURRENT] Total cores: {}", (*runtime.core_set.begin()).size());
@@ -128,6 +136,7 @@ void Map::execute() {
             .page_size = stream->element_size * TILE_WIDTH * TILE_HEIGHT, // TODO: Not sure what is optimal for this.
             .buffer_type = tt_metal::BufferType::DRAM
         };
+        std::cout << "STREAM " << i << ": size: " << config.size << std::endl;
         stream->device_buffer = tt_metal::CreateBuffer(config);
         // TODO: Does this need to be blocking?
         // TODO: What if there's a mismatch between the host data size and the device buffer size?
@@ -147,166 +156,210 @@ void Map::execute() {
         }
     }
 
+    auto total_cores = cores.size();
+    std::cout << "Total cores: " << total_cores << std::endl;
+    size_t cores_used = 0;
     for (size_t i = 0; i < kernels.size(); i++) {
         // Each kernel gets mapped to a single core. 
         // We just assign to the next available core.
         // TODO: Look into core placement strategies (RaftLib thesis)
         // possibly doing automatic parallelization of kernels.
         // NOTE: This also requires that we need as many cores as kernels.
-        kernels[i]->core_spec = cores[i];
+        size_t cores_availible = total_cores - cores_used;
+        size_t cores_to_assign = std::min(cores_availible, (size_t)MAX_PARALLELIZATION_FACTOR);
+
+        std::vector<CoreCoord> kernel_cores;
+        for (size_t j = 0; j < cores_to_assign; j++) {
+            kernel_cores.push_back(cores[cores_used + j]);
+        }
+
+        kernels[i]->core_spec = kernel_cores;
+        cores_used += cores_to_assign;
+
+        std::cout << "Kernel " << i << " assigned to cores: ";
+        for (const auto& core : kernel_cores) {
+            std::cout << "(" << core.x << ", " << core.y << ") ";
+        }
+        std::cout << std::endl;
     }
+
+    // Print core distribution.
 
     for (size_t i = 0; i < kernels.size(); i++) {
         auto kernel = kernels[i];
-        // Create semaphores for each kernel.
-        kernel->sender_semaphore_id = tt_metal::CreateSemaphore(runtime.program, kernel->core_spec, INVALID);
-        kernel->receiver_semaphore_id = tt_metal::CreateSemaphore(runtime.program, kernel->core_spec, INVALID);
-        kernel->l1_valid_value_semaphore_id = tt_metal::CreateSemaphore(runtime.program, kernel->core_spec, VALID);
 
-        auto incoming_connections = get_incoming_connections(kernel);
-        auto outgoing_connections = get_outgoing_connections(kernel);
+        // Parallelize kernel across multiple cores.
+        auto parallelization_factor = kernel->core_spec.size(); // # of cores this kernel is parallelized across.
+        for (size_t j = 0; j < parallelization_factor; j++) {
+            auto core = kernel->core_spec[j];
 
-        // Create circular buffers for each incoming and outgoing connection.
-        for (size_t i = 0; i < incoming_connections.size(); i++) {
-            // Each port is typed with a specific data format. 
-            auto cb_index = i + IN_CB_START;
-            auto input_port = kernel->get_input_port(incoming_connections[i].dest.port);
-            auto input_port_index = kernel->get_input_port_index(input_port.name);
-            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(input_port.data_format);
-            tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
-                TILES_PER_CB * tile_size_bytes,
-                {{cb_index, input_port.data_format}}
-            ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
-            kernel->input_ports[input_port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
+            // Create semaphores for each kernel.
+            // TODO: Is overwriting across multiple cores, though we might not even need to store this ID for later.
+            kernel->sender_semaphore_id = tt_metal::CreateSemaphore(runtime.program, core, INVALID);
+            kernel->receiver_semaphore_id = tt_metal::CreateSemaphore(runtime.program, core, INVALID);
+            kernel->l1_valid_value_semaphore_id = tt_metal::CreateSemaphore(runtime.program, core, VALID);
 
-            // // Create mailbox buffer for incoming connections from another kernel.
-            // if (incoming_connections[i].source.is_kernel()) {
-            //     auto mailbox_config = tt_metal::InterleavedBufferConfig{
-            //         .device = runtime.device,
-            //         .size = tile_size_bytes,
-            //         .page_size = tile_size_bytes,
-            //         .buffer_type = tt_metal::BufferType::L1
-            //     };
-            //     kernel->input_ports[input_port_index].mailbox = tt_metal::CreateBuffer(mailbox_config);
-            // }
-        }
+            auto incoming_connections = get_incoming_connections(kernel);
+            auto outgoing_connections = get_outgoing_connections(kernel);
 
-        for (size_t i = 0; i < outgoing_connections.size(); i++) {
-            auto cb_index = i + OUT_CB_START;
-            auto output_port = kernel->get_output_port(outgoing_connections[i].source.port);
-            auto output_port_index = kernel->get_output_port_index(output_port.name);
-            auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(output_port.data_format);
-            tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
-                TILES_PER_CB * tile_size_bytes,
-                {{cb_index, output_port.data_format}}
-            ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
-            kernel->output_ports[output_port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, kernel->core_spec, cb_config);
-        }
+            // Create circular buffers for each incoming and outgoing connection.
+            for (size_t k = 0; k < incoming_connections.size(); k++) {
+                // Each port is typed with a specific data format. 
+                auto cb_index = k + IN_CB_START;
+                auto input_port = kernel->get_input_port(incoming_connections[k].dest.port);
+                auto input_port_index = kernel->get_input_port_index(input_port.name);
+                auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(input_port.data_format);
+                tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
+                    TILES_PER_CB * tile_size_bytes,
+                    {{cb_index, input_port.data_format}}
+                ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
+                // TODO: Again, overwriting across multiple cores.
+                kernel->input_ports[input_port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, core, cb_config);
 
-        // Create device kernels.
-        auto reader = tt_metal::CreateKernel(
-            runtime.program,
-            kernel->generated_reader_kernel_path,
-            kernel->core_spec,
-            // TODO: Can also do compile-time args here? I think this might be useful.
-            DataMovementConfig {
-                .processor = DataMovementProcessor::RISCV_0, 
-                .noc = NOC::RISCV_0_default,
-                .compile_args = {},
-                .defines = {}
-            } // TODO: What to do for this?
-        );
-        kernel->reader_kernel = reader;
-
-        auto compute = tt_metal::CreateKernel(
-            runtime.program,
-            kernel->generated_compute_kernel_path,
-            kernel->core_spec,
-            ComputeConfig{
-                // TODO: Also need to figure out what the heck to do for this.
-                .dst_full_sync_en = true, // Don't know what this is lol
-                .math_approx_mode = false,
-                .compile_args = {},
-                .defines = {}
+                // // Create mailbox buffer for incoming connections from another kernel.
+                // if (incoming_connections[i].source.is_kernel()) {
+                //     auto mailbox_config = tt_metal::InterleavedBufferConfig{
+                //         .device = runtime.device,
+                //         .size = tile_size_bytes,
+                //         .page_size = tile_size_bytes,
+                //         .buffer_type = tt_metal::BufferType::L1
+                //     };
+                //     kernel->input_ports[input_port_index].mailbox = tt_metal::CreateBuffer(mailbox_config);
+                // }
             }
-        );
-        kernel->compute_kernel = compute;
 
-        auto writer = tt_metal::CreateKernel(
-            runtime.program,
-            kernel->generated_writer_kernel_path,
-            kernel->core_spec,
-            DataMovementConfig {
-                .processor = DataMovementProcessor::RISCV_1,
-                .noc = NOC::RISCV_1_default,
-                .compile_args = {},
-                .defines = {}
+            for (size_t k = 0; k < outgoing_connections.size(); k++) {
+                auto cb_index = k + OUT_CB_START;
+                auto output_port = kernel->get_output_port(outgoing_connections[k].source.port);
+                auto output_port_index = kernel->get_output_port_index(output_port.name);
+                auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(output_port.data_format);
+                tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
+                    TILES_PER_CB * tile_size_bytes,
+                    {{cb_index, output_port.data_format}}
+                ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
+                // TODO: Again, overwriting across multiple cores.
+                kernel->output_ports[output_port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, core, cb_config);
             }
-        );
-        kernel->writer_kernel = writer;
 
-        // Set runtime args.
-        std::vector<uint32_t> reader_args;
-        std::vector<uint32_t> compute_args;
-        for (const auto& connection : incoming_connections) {
-            auto n_tiles = connection.n_tiles;
-            if (connection.source.is_stream()) {
-                // For every incoming stream connection, we need to know how many tiles we expect to read and what the DRAM address is.
-                auto stream = streams[connection.source.index];
-                reader_args.push_back(n_tiles);
-                reader_args.push_back(stream->device_buffer_address);
-                compute_args.push_back(n_tiles); // Compute also needs to know how many tiles to read in.
-            } else {
-                // Incoming connection is another kernel. 
-                auto sender = kernels[connection.source.index];
-                CoreCoord sender_core = sender->core_spec;
-                uint32_t sender_x = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).x;
-                uint32_t sender_y = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).y;
-                reader_args.push_back(n_tiles);
-                reader_args.push_back(sender_x);
-                reader_args.push_back(sender_y);
-                reader_args.push_back(kernel->sender_semaphore_id);
-                reader_args.push_back(kernel->receiver_semaphore_id);
-                reader_args.push_back(kernel->l1_valid_value_semaphore_id);
-                compute_args.push_back(n_tiles);
+            // Create device kernels.
+            auto reader = tt_metal::CreateKernel(
+                runtime.program,
+                kernel->generated_reader_kernel_path,
+                core,
+                // TODO: Can also do compile-time args here? I think this might be useful.
+                DataMovementConfig {
+                    .processor = DataMovementProcessor::RISCV_0, 
+                    .noc = NOC::RISCV_0_default,
+                    .compile_args = {},
+                    .defines = {}
+                } // TODO: What to do for this?
+            );
+            kernel->reader_kernel = reader;
+
+            auto compute = tt_metal::CreateKernel(
+                runtime.program,
+                kernel->generated_compute_kernel_path,
+                core,
+                ComputeConfig{
+                    // TODO: Also need to figure out what the heck to do for this.
+                    .math_fidelity = MathFidelity::LoFi,
+                    .dst_full_sync_en = false, // Don't know what this is lol
+                    .math_approx_mode = false,
+                    .compile_args = {},
+                    .defines = {},
+                }
+            );
+            kernel->compute_kernel = compute;
+
+            auto writer = tt_metal::CreateKernel(
+                runtime.program,
+                kernel->generated_writer_kernel_path,
+                core,
+                DataMovementConfig {
+                    .processor = DataMovementProcessor::RISCV_1,
+                    .noc = NOC::RISCV_1_default,
+                    .compile_args = {},
+                    .defines = {}
+                }
+            );
+            kernel->writer_kernel = writer;
+
+            // Set runtime args.
+            std::vector<uint32_t> reader_args;
+            std::vector<uint32_t> compute_args;
+            for (const auto& connection : incoming_connections) {
+                uint32_t n_tiles = connection.n_tiles / parallelization_factor; // TODO: Account for when n_tiles % parallelization_factor != 0.
+                uint32_t tile_offset = n_tiles * j;
+                std::cout << "n_tiles: " << n_tiles << " tile_offset: " << tile_offset << std::endl;
+                if (connection.source.is_stream()) {
+                    // For every incoming stream connection, we need to know how many tiles we expect to read and what the DRAM address is.
+                    auto stream = streams[connection.source.index];
+                    reader_args.push_back(n_tiles);
+                    reader_args.push_back(stream->device_buffer_address);
+                    reader_args.push_back(tile_offset);
+                    compute_args.push_back(n_tiles); // Compute also needs to know how many tiles to read in.
+                } else {
+                    // Incoming connection is another kernel. 
+                    // TODO: I'm not sure if this is correct with the way I'm doing parallelization. Would make more sense to transform the program graph itself.
+                    auto sender = kernels[connection.source.index];
+                    CoreCoord sender_core = sender->core_spec[j];
+                    uint32_t sender_x = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).x;
+                    uint32_t sender_y = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).y;
+                    reader_args.push_back(n_tiles);
+                    reader_args.push_back(sender_x);
+                    reader_args.push_back(sender_y);
+                    reader_args.push_back(kernel->sender_semaphore_id);
+                    reader_args.push_back(kernel->receiver_semaphore_id);
+                    reader_args.push_back(kernel->l1_valid_value_semaphore_id);
+                    compute_args.push_back(n_tiles);
+                }
             }
+            SetRuntimeArgs(runtime.program, kernel->reader_kernel, core, reader_args);
+            SetRuntimeArgs(runtime.program, kernel->compute_kernel, core, compute_args);
+
+            std::vector<uint32_t> writer_args;
+            for (const auto& connection : outgoing_connections) {
+                uint32_t n_tiles = connection.n_tiles / parallelization_factor; // TODO: Account for when n_tiles % parallelization_factor != 0.
+                uint32_t tile_offset = n_tiles * j; // TODO: Only works if total work is evenly divisible by parallelization factor.
+                if (connection.dest.is_stream()) {
+                    // TODO: Here we are explicitly setting the # of tiles we expect to write to be the same as the capacity of the stream.
+                    // This can get a bit tricky if the compute does any sort of reduction and the user does not correctly set the capacity.
+                    // I think if reduction kernels get implemented then we need a way of automatically determining the # of tiles to write at each stage of the program.
+                    auto stream = streams[connection.dest.index];
+                    writer_args.push_back(n_tiles);
+                    writer_args.push_back(stream->device_buffer_address);
+                    writer_args.push_back(tile_offset);
+                } else {
+                    // Outgoing connection is another kernel.
+                    auto receiver = kernels[connection.dest.index];
+                    CoreCoord receiver_core = receiver->core_spec[j];
+                    uint32_t receiver_x = (uint32_t)runtime.device->worker_core_from_logical_core(receiver_core).x;
+                    uint32_t receiver_y = (uint32_t)runtime.device->worker_core_from_logical_core(receiver_core).y;
+                    uint32_t receiver_mailbox_addr = kernel->get_input_port(connection.dest.port).mailbox->address();
+                    writer_args.push_back(n_tiles);
+                    writer_args.push_back(receiver_x);
+                    writer_args.push_back(receiver_y);
+                    // writer_args.push_back(receiver_mailbox_addr);
+                    writer_args.push_back(kernel->sender_semaphore_id);
+                    writer_args.push_back(kernel->receiver_semaphore_id);
+                    writer_args.push_back(kernel->l1_valid_value_semaphore_id);
+                }
+            }
+            SetRuntimeArgs(runtime.program, kernel->writer_kernel, core, writer_args);
         }
-        SetRuntimeArgs(runtime.program, kernel->reader_kernel, kernel->core_spec, reader_args);
-        SetRuntimeArgs(runtime.program, kernel->compute_kernel, kernel->core_spec, compute_args);
-
-        std::vector<uint32_t> writer_args;
-        for (const auto& connection : outgoing_connections) {
-            auto n_tiles = connection.n_tiles;
-            if (connection.dest.is_stream()) {
-                // TODO: Here we are explicitly setting the # of tiles we expect to write to be the same as the capacity of the stream.
-                // This can get a bit tricky if the compute does any sort of reduction and the user does not correctly set the capacity.
-                // I think if reduction kernels get implemented then we need a way of automatically determining the # of tiles to write at each stage of the program.
-                auto stream = streams[connection.dest.index];
-                writer_args.push_back(n_tiles);
-                writer_args.push_back(stream->device_buffer_address);
-            } else {
-                // Outgoing connection is another kernel.
-                auto receiver = kernels[connection.dest.index];
-                CoreCoord receiver_core = receiver->core_spec;
-                uint32_t receiver_x = (uint32_t)runtime.device->worker_core_from_logical_core(receiver_core).x;
-                uint32_t receiver_y = (uint32_t)runtime.device->worker_core_from_logical_core(receiver_core).y;
-                uint32_t receiver_mailbox_addr = kernel->get_input_port(connection.dest.port).mailbox->address();
-                writer_args.push_back(n_tiles);
-                writer_args.push_back(receiver_x);
-                writer_args.push_back(receiver_y);
-                // writer_args.push_back(receiver_mailbox_addr);
-                writer_args.push_back(kernel->sender_semaphore_id);
-                writer_args.push_back(kernel->receiver_semaphore_id);
-                writer_args.push_back(kernel->l1_valid_value_semaphore_id);
-            }
-        }
-        SetRuntimeArgs(runtime.program, kernel->writer_kernel, kernel->core_spec, writer_args);
     }
 
-    tt_metal::EnqueueProgram(runtime.device->command_queue(), runtime.program, true);
+    // Collect benchmark metrics.
+    auto start = std::chrono::high_resolution_clock::now();
+    tt_metal::EnqueueProgram(runtime.device->command_queue(), runtime.program, false);
     tt_metal::Finish(runtime.device->command_queue());
-    tt::log_info("[CURRENT] Program execution completed!");
-
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    tt::log_info("[CURRENT] Program execution completed! Time taken: {} milliseconds", duration.count());
+    auto total_bytes = streams[0]->n_elements * streams[0]->element_size;
+    tt::log_info("[CURRENT] Total bytes transferred: {}", total_bytes);
+    double total_seconds = duration.count() / 1000.0;
+    tt::log_info("[CURRENT] Total throughput: {} GB/s", (total_bytes / total_seconds) / 1e9);
     // tt_metal::CloseDevice(runtime.device);
 }
 
@@ -399,6 +452,9 @@ void Map::generate_reader_device_kernel(
             rs << "    uint32_t " << port.name << "_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
             rs << "    DPRINT << \"READER0: " << port.name << "_addr: \" << " << port.name << "_addr << ENDL();\n";
             total_args++;
+            rs << "    uint32_t " << port.name << "_tile_offset = get_arg_val<uint32_t>(" << total_args << ");\n";
+            rs << "    DPRINT << \"READER0: " << port.name << "_tile_offset: \" << " << port.name << "_tile_offset << ENDL();\n";
+            total_args++;
             // Address generator.
             // TODO: Do we need this? How does this even work?
             rs << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
@@ -439,6 +495,7 @@ void Map::generate_reader_device_kernel(
         // Assign CBs to input ports in iteration order.
         auto port = kernel->get_input_port(incoming_connections[i].dest.port);
         rs << "    constexpr uint32_t " << port.name << " = " << num_input_cbs << ";\n";
+        rs << "    DPRINT << \"READER0: " << port.name << " tile_size: \" << get_tile_size(" << port.name << ") << ENDL();\n";
         num_input_cbs++;
     }
     rs << "\n";
@@ -490,7 +547,9 @@ void Map::generate_reader_device_kernel(
             auto port = kernel->get_input_port(incoming_connections[i].dest.port);
             rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
             rs << "            uint32_t " << port.name << "_write_ptr = get_write_ptr(" << port.name << ");\n";
-            rs << "            noc_async_read_tile(" << port.name<< "_count, " <<  port.name << "_addr_gen, " << port.name << "_write_ptr);\n";
+            rs << "            uint32_t id = " << port.name << "_tile_offset + " << port.name << "_count;\n";
+            rs << "            DPRINT << \"READER0: id: \" << id << ENDL();\n";
+            rs << "            noc_async_read_tile(id, " <<  port.name << "_addr_gen, " << port.name << "_write_ptr);\n";
             rs << "        }\n";
         }
 
@@ -694,6 +753,8 @@ void Map::generate_compute_device_kernel(
         // cs << "        copy_tile(" << port.name << ", 0, " << incoming_connections.size() - i - 1 << ");\n";
         cs << "        copy_tile(" << port.name << ", 0, " << i << ");\n";
         // cs << "        UNPACK(( llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(" << port.name << ", 0)  ));\n";
+        // TODO: Not sure how this works in the context of the compute cores. Which core is doing this pop?
+        cs << "        cb_pop_front(" << port.name << ", 1);\n";
     }
 
     // for (size_t i = 0; i < incoming_connections.size(); i++) {
@@ -707,13 +768,14 @@ void Map::generate_compute_device_kernel(
     cs << "        MATH((sfpi::compute()));\n";
     cs << "        tile_regs_commit();\n";
     cs << "\n";
-    // Computation finished, pop tiles from input CBs
-    // TODO: This may be able to be re-ordered?
-    for (size_t i = 0; i < incoming_connections.size(); i++) {
-        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
-        cs << "        cb_pop_front(" << port.name << ", 1);\n";
-    }
-    cs << "\n";
+
+    // // Computation finished, pop tiles from input CBs
+    // // TODO: This may be able to be re-ordered?
+    // for (size_t i = 0; i < incoming_connections.size(); i++) {
+    //     auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+    //     cs << "        cb_pop_front(" << port.name << ", 1);\n";
+    // }
+    // cs << "\n";
 
     // Packer waits here until the SFPU is done.
     cs << "        tile_regs_wait();\n";
@@ -789,9 +851,14 @@ void Map::generate_writer_device_kernel(
             auto port = kernel->get_output_port(connection.source.port);
             // Total # of tiles this kernel will write to this stream.
             ws << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
+            ws << "    DPRINT << \"WRITER0: " << port.name << "_ntiles: \" << " << port.name << "_ntiles << ENDL();\n";
             total_args++;
             // For every outgoing stream connection, we need to get it's address and create an address generator.
             ws << "    uint32_t " << port.name << "_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
+            ws << "    DPRINT << \"WRITER0: " << port.name << "_addr: \" << " << port.name << "_addr << ENDL();\n";
+            total_args++;
+            ws << "    uint32_t " << port.name << "_tile_offset = get_arg_val<uint32_t>(" << total_args << ");\n";
+            ws << "    DPRINT << \"WRITER0: " << port.name << "_tile_offset: \" << " << port.name << "_tile_offset << ENDL();\n";
             total_args++;
             // Address generator.
             // TODO: Do we need this? How does this even work?
@@ -838,6 +905,7 @@ void Map::generate_writer_device_kernel(
         // Assign CBs to input ports in iteration order.
         auto port = kernel->get_output_port(outgoing_connections[i].source.port);
         ws << "    constexpr uint32_t " << port.name << " = " << num_output_cbs << ";\n";
+        ws << "    DPRINT << \"WRITER0: " << port.name << " tile_size: \" << get_tile_size(" << port.name << ") << ENDL();\n";
         num_output_cbs++;
     }
     ws << "\n";
@@ -876,7 +944,9 @@ void Map::generate_writer_device_kernel(
         }
         auto port = kernel->get_output_port(outgoing_connections[i].source.port);
         ws << "        uint32_t " << port.name << "_read_ptr = get_read_ptr(" << port.name << ");\n";
-        ws << "        noc_async_write_tile(i, " << port.name << "_addr_gen, " << port.name << "_read_ptr);\n";
+        ws << "        uint32_t id = " << port.name << "_tile_offset + i;\n";
+        ws << "        DPRINT << \"WRITER0: id: \" << id << ENDL();\n";
+        ws << "        noc_async_write_tile(id, " << port.name << "_addr_gen, " << port.name << "_read_ptr);\n";
     }
     // Wait until tile writes are done.
     ws << "\n";
