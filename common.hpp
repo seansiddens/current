@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common/bfloat16.hpp"
+#include "bfloat16.hpp"
 
 // TODO: Need to determine when/how these will be set. 
 // I think I might want to keep this constant for a given runtime program graph.

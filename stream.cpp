@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "common/bfloat16.hpp"
+#include "core_coord.hpp"
 #include "impl/buffers/buffer.hpp"
 #include "impl/buffers/circular_buffer_types.hpp"
 #include "work_split.hpp"
@@ -122,10 +123,10 @@ void Map::execute() {
     auto compute_with_storage_grid_size = runtime.device->compute_with_storage_grid_size();
     runtime.num_cores_x = compute_with_storage_grid_size.x;
     runtime.num_cores_y = compute_with_storage_grid_size.y;
-    runtime.core_set = num_cores_to_corerange_set({0, 0}, kernels.size() * MAX_PARALLELIZATION_FACTOR, {runtime.num_cores_x, runtime.num_cores_y});
+    runtime.core_set = num_cores_to_corerangeset({0, 0}, kernels.size() * MAX_PARALLELIZATION_FACTOR, {runtime.num_cores_x, runtime.num_cores_y});
     tt::log_info("[CURRENT] num_cores_x: {}, num_cores_y: {}", runtime.num_cores_x, runtime.num_cores_y);
-    tt::log_info("[CURRENT] core_set: {}", runtime.core_set);
-    tt::log_info("[CURRENT] Total cores: {}", (*runtime.core_set.begin()).size());
+    tt::log_info("[CURRENT] core_set: {}", runtime.core_set.str());
+    tt::log_info("[CURRENT] Total cores: {}", runtime.core_set.num_cores());
 
     // 3. Input & Output DRAM buffer setup.
     for (size_t i = 0; i < streams.size(); i++) {
@@ -149,12 +150,7 @@ void Map::execute() {
     generate_device_kernels();
 
     // Vector of cores we have availible to assign to kernels.
-    std::vector<CoreCoord> cores;
-    for (const CoreRange& range : runtime.core_set) {
-        for (const CoreCoord& core : range) {
-            cores.push_back(core);
-        }
-    }
+    std::vector<CoreCoord> cores = corerange_to_cores(runtime.core_set);
 
     auto total_cores = cores.size();
     std::cout << "Total cores: " << total_cores << std::endl;

@@ -1,5 +1,5 @@
 #include "bfloat8.hpp"
-#include "common/core_coord.h"
+#include "common/core_coord.hpp"
 #include "logger.hpp"
 #include "tt_metal/host_api.hpp"
 #include "tt_metal/impl/device/device.hpp"
@@ -20,6 +20,7 @@
 #include "stream.hpp"
 
 using namespace tt;
+using namespace tt::tt_metal;
 
 using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
 

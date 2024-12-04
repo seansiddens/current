@@ -159,7 +159,7 @@ class Map {
         uint32_t num_cores;
         uint32_t num_cores_x;
         uint32_t num_cores_y;
-        std::set<tt_metal::CoreRange> core_set;
+        tt_metal::CoreRangeSet core_set;
     };
 
     // Represents a connection endpoint (either kernel or stream)
