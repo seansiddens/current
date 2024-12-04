@@ -255,7 +255,16 @@ void Map::execute() {
                 } // TODO: What to do for this?
             );
             kernel->reader_kernel = reader;
-
+            // DST is capable of storing 16 32x32 tiles of 2B datum size. In full mode, DST is not double buffered, so the full 16 tiles are available for LLKs to use. 
+            // In half mode, we treat DST as a ping pong buffer, where each half contains 8 tiles. That means that an LLK can only index into 8 different tiles in DST. 
+            // This is useful to overlap the MATH and PACK threads. 
+            // Example: MATH will acquire the first half of DST and populate it with 8 tiles of output from some math LLK. 
+            // MATH releases first half and acquires second half. 
+            // PACK acquires first half and writes tiles from DST to L1. 
+            // Meanwhile, MATH is producing results into the second half of DST. 
+            // We continue ping ponging to keep MATH and PACK busy at the same time. 
+            // I haven’t heard about “TILE” mode, not sure if that’s used anywhere. 
+            // HALF mode is most common and afaik expected to be the default.
             auto compute = tt_metal::CreateKernel(
                 runtime.program,
                 kernel->generated_compute_kernel_path,
@@ -266,7 +275,7 @@ void Map::execute() {
                     .dst_full_sync_en = false, // Don't know what this is lol
                     .math_approx_mode = false,
                     .compile_args = {},
-                    .defines = {},
+                    .defines = {}
                 }
             );
             kernel->compute_kernel = compute;
@@ -416,6 +425,7 @@ std::string data_format_to_string(tt::DataFormat data_format) {
     // std::cout << "Data format: " << data_format << "\n";
     switch (data_format) {
         case tt::DataFormat::Float16_b: return "DataFormat::Float16_b";
+        case tt::DataFormat::Bfp8_b: return "DataFormat::Bfp8_b";
         default:
             std::cerr << "Unsupported data format!\n";
             exit(1);
@@ -630,6 +640,7 @@ void Map::generate_compute_device_kernel(
     cs << "#include \"compute_kernel_api/tile_move_copy.h\"\n";
     cs << "#include \"compute_kernel_api/eltwise_binary.h\"\n";
     cs << "#include \"compute_kernel_api/eltwise_unary/eltwise_unary.h\"\n";
+    cs << "#include \"compute_kernel_api/matmul.h\"\n";
     cs << "#include \"compute_kernel_api.h\"\n";
     cs << "#include \"cmath_common.h\"\n";
     cs << "#include \"sfpi.h\"\n";
@@ -713,7 +724,12 @@ void Map::generate_compute_device_kernel(
         auto port = kernel->get_input_port(incoming_connections[i].dest.port);
         cs << "    init_sfpu(" << port.name << ");\n";
     }
+    if (kernel->do_matmul) {
+        // TODO: This assumes that we are matmuling port 0 and 1.
+        cs << "    mm_init();\n";
+    }
     cs << "\n";
+
     // cs << "    copy_tile_init();\n";
 
     // Tile stream loop
@@ -728,33 +744,41 @@ void Map::generate_compute_device_kernel(
 
     // Copy tiles from CBs to SFPU registers.
     cs << "        tile_regs_acquire();\n";
-    for (size_t i = 0; i < incoming_connections.size(); i++) {
-        // auto port = kernel->get_input_port(incoming_connections[incoming_connections.size() - i - 1].dest.port);
-        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
-        /**
-        * Copies a single tile from the specified input CB and writes the result to
-        * DST at a specified index. The function will employ unpacker to first unpack into SRC
-        * registers and then perform move into DST registers, at a specified index.
-        * For the in_tile_index to be valid for this call, cb_wait_front(n) had to be
-        * previously called to ensure that at least some number n>0 of tiles are available
-        * in the input CB. The CB index 0 then references the first tile in the received section of the CB,
-        * up to index n-1 (in a FIFO order). The DST register buffer must be in acquired state via
-        * acquire_dst call. This call is blocking and is only available on the compute
-        * engine.
-        *
-        * Return value: None
-        *
-        * | Argument       | Description                                       | Data type | Valid range                                         | required |
-        * |----------------|---------------------------------------------------|-----------|-----------------------------------------------------|----------|
-        * | in_cb_id       | The identifier of the source circular buffer (CB) | uint32_t  | 0 to 31                                             | Yes      |
-        * | in_tile_index  | The index of the tile to copy from the input CB   | uint32_t  | Must be less than the size of the CB                | Yes      |
-        * | dst_tile_index | The index of the tile in the DST register         | uint32_t  | Must be less than the size of the DST register (16) | Yes      |
-        * */
-        // cs << "        copy_tile(" << port.name << ", 0, " << incoming_connections.size() - i - 1 << ");\n";
-        cs << "        copy_tile(" << port.name << ", 0, " << i << ");\n";
-        // cs << "        UNPACK(( llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(" << port.name << ", 0)  ));\n";
-        // TODO: Not sure how this works in the context of the compute cores. Which core is doing this pop?
-        cs << "        cb_pop_front(" << port.name << ", 1);\n";
+    if (kernel->do_matmul) {
+        // TODO: Again, assuming that we are matmuling port 0 and 1 and we don't have any other input ports.
+        cs << "        ckernel::matmul_tiles(" << kernel->get_input_port(incoming_connections[0].dest.port).name << ", " << kernel->get_input_port(incoming_connections[1].dest.port).name << ", 0, 0, 0, 0);\n";
+        for (size_t i = 0; i < incoming_connections.size(); i++) {
+            cs << "        cb_pop_front(" << kernel->get_input_port(incoming_connections[i].dest.port).name << ", 1);\n";
+        }
+    } else {
+        for (size_t i = 0; i < incoming_connections.size(); i++) {
+            // auto port = kernel->get_input_port(incoming_connections[incoming_connections.size() - i - 1].dest.port);
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            /**
+            * Copies a single tile from the specified input CB and writes the result to
+            * DST at a specified index. The function will employ unpacker to first unpack into SRC
+            * registers and then perform move into DST registers, at a specified index.
+            * For the in_tile_index to be valid for this call, cb_wait_front(n) had to be
+            * previously called to ensure that at least some number n>0 of tiles are available
+            * in the input CB. The CB index 0 then references the first tile in the received section of the CB,
+            * up to index n-1 (in a FIFO order). The DST register buffer must be in acquired state via
+            * acquire_dst call. This call is blocking and is only available on the compute
+            * engine.
+            *
+            * Return value: None
+            *
+            * | Argument       | Description                                       | Data type | Valid range                                         | required |
+            * |----------------|---------------------------------------------------|-----------|-----------------------------------------------------|----------|
+            * | in_cb_id       | The identifier of the source circular buffer (CB) | uint32_t  | 0 to 31                                             | Yes      |
+            * | in_tile_index  | The index of the tile to copy from the input CB   | uint32_t  | Must be less than the size of the CB                | Yes      |
+            * | dst_tile_index | The index of the tile in the DST register         | uint32_t  | Must be less than the size of the DST register (16) | Yes      |
+            * */
+            // cs << "        copy_tile(" << port.name << ", 0, " << incoming_connections.size() - i - 1 << ");\n";
+            cs << "        copy_tile(" << port.name << ", 0, " << i << ");\n";
+            // cs << "        UNPACK(( llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(" << port.name << ", 0)  ));\n";
+            // TODO: Not sure how this works in the context of the compute cores. Which core is doing this pop?
+            cs << "        cb_pop_front(" << port.name << ", 1);\n";
+        }
     }
 
     // for (size_t i = 0; i < incoming_connections.size(); i++) {

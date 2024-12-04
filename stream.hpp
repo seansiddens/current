@@ -63,9 +63,10 @@ class Kernel {
     uint32_t num_input_ports() const;
     uint32_t num_output_ports() const;
 
-    void set_compute_kernel(const std::string& code) {
+    void set_compute_kernel(const std::string& code, bool do_matmul = false) {
         size_t last = code.find_last_not_of(" \t\n\r");
         sfpi_kernel_string = (last != std::string::npos) ? code.substr(0, last + 1) + "\n\n" : "";
+        this->do_matmul = do_matmul;
     }
 
     uint32_t get_input_port_index(std::string port_name) const {
@@ -119,6 +120,7 @@ class Kernel {
     std::filesystem::path generated_compute_kernel_path;
     std::filesystem::path generated_writer_kernel_path;
     std::string sfpi_kernel_string;
+    bool do_matmul = false;
     // TODO: This only allows for one sender and receiver per kernel.
     // Eventually would want to support multiple senders and receivers per kernel
     // e.g when we have multiple output ports, each participatnig in producer/consumer.
