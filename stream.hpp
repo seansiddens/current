@@ -58,7 +58,15 @@ class GatherStream : public Stream {
     GatherStream(const std::vector<uint32_t>& data_buffer, 
                  tt::DataFormat data_format,
                  const std::vector<uint32_t>& index_data)
-                 : Stream(index_data, index_data.size(), tt::DataFormat::UInt32), data_buffer(data_buffer), data_format(data_format) {
+                 : Stream(index_data, index_data.size(), tt::DataFormat::UInt32), data_format(data_format) {
+        // auto n_elements = (data_buffer.size() * sizeof(data_buffer[0])) / datum_size(this->data_format);
+        this->data_buffer.resize(data_buffer.size() * 8); // Every data element needs to be 32-byte aligned (8 u32s).
+        for (size_t i = 0; i < this->data_buffer.size(); i++) {
+            // size_t idx = static_cast<uint32_t>(i) & ~7U; // Clears 3 LSBs, rounding down to nearest multiple of 8.
+            size_t idx = static_cast<uint32_t>(i / 8U);
+            this->data_buffer[i] = data_buffer[idx];
+            // std::cout << "data_buf " << i << ": " << this->data_buffer[i] << "\n";
+        }
     }
 
     [[nodiscard]] bool is_gather_stream() const override { return true; }
