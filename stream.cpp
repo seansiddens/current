@@ -464,6 +464,15 @@ void Map::generate_reader_device_kernel(
                 rs << "        .page_size = " << TILE_WIDTH * TILE_HEIGHT * gather_stream->element_size << ", \n";
                 rs << "        .data_format = " << data_format_to_string(gather_stream->format) << ", \n";
                 rs << "    };\n\n";
+
+                // Args for data buffer of gather stream. This doesn't use an address generator since we are doing non-contiguous reads.
+                rs << "    uint32_t " << port.name << "_data_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
+                total_args++;
+                rs << "    uint32_t " << port.name << "_data_dram_noc_x = get_arg_val<uint32_t>(" << total_args << ");\n";
+                total_args++;
+                rs << "    uint32_t " << port.name << "_data_dram_noc_y = get_arg_val<uint32_t>(" << total_args << ");\n";
+                total_args++;
+                rs << "\n\n";
             } else {
                 auto *stream = streams[connection.source.index];
                 // Total # of tiles this kernel will read from this stream.
@@ -513,13 +522,23 @@ void Map::generate_reader_device_kernel(
     }
 
     // Circular buffers.
-    uint32_t num_input_cbs = 0;
+    uint32_t num_input_cbs = IN_CB_START;
     for (size_t i = 0; i < incoming_connections.size(); i++) {
+        auto connection = incoming_connections[i];
         // Assign CBs to input ports in iteration order.
-        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+        auto port = kernel->get_input_port(connection.dest.port);
         rs << "    constexpr uint32_t " << port.name << " = " << num_input_cbs << ";\n";
         rs << "    DPRINT << \"READER0: " << port.name << " tile_size: \" << get_tile_size(" << port.name << ") << ENDL();\n";
         num_input_cbs++;
+
+        if (connection.source.is_stream()) {
+            auto *stream = streams[connection.source.index];
+            if (stream->is_gather_stream()) {
+                // Incoming gather streams need two CBs. The data will be put in an "input" CB, while the indices will be staged in an intermed CB.
+                rs << "    constexpr uint32_t " << port.name << "_indices = " << INTERMED_CB_START + num_input_cbs << ";\n";
+                rs << "    DPRINT << \"READER0: " << port.name << "_indices tile_size: \" << get_tile_size(" << port.name << "_indices" << ") << ENDL();\n";
+            }
+        }
     }
     rs << "\n";
 

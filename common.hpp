@@ -12,6 +12,7 @@ constexpr uint32_t TILE_SIZE = TILE_WIDTH * TILE_HEIGHT;
 constexpr uint32_t TILE_SIZE_BYTES = TILE_SIZE * sizeof(bfloat16);
 constexpr uint32_t TILES_PER_CB = 4;
 constexpr uint32_t IN_CB_START = 0;
+constexpr uint32_t INTERMED_CB_START = 8;
 constexpr uint32_t OUT_CB_START = 16;
 constexpr uint32_t MAX_INPUT_PORTS = 16;
 constexpr uint32_t MAX_OUTPUT_PORTS = 16;
