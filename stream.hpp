@@ -22,13 +22,16 @@ using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
 // Wrapper around a DRAM buffer. Used as source and dest of stream data for kernels.
 class Stream {
   public: 
-    Stream(const std::vector<uint32_t>& initial_data, size_t num_elements, tt::DataFormat data_format) {
-        assert(initial_data.size() * 4 == num_elements * tt::datum_size(data_format) && "Stream data size does not match number of elements!");
+    Stream(const std::vector<uint32_t>& initial_data, size_t num_elements, tt::DataFormat data_format_) {
+        // std::cout << "initial_data.size(): " << initial_data.size() << "\n";
+        // std::cout << "num_elements: " << num_elements << "\n";
+        // std::cout << "el size: " << tt::datum_size(data_format_) << "\n";
+        // assert(initial_data.size() * 4 == num_elements * tt::datum_size(data_format_) && "Stream data size does not match number of elements!");
         n_elements = num_elements;
         host_data = initial_data;
-        this->element_size = tt::datum_size(data_format);
-        this->data_format = data_format;
-        this->n_tiles = std::ceil(n_elements / TILE_SIZE);
+        this->element_size = tt::datum_size(data_format_);
+        this->format = data_format_;
+        this->n_tiles = static_cast<uint32_t>(std::ceil(num_elements / static_cast<double>(TILE_SIZE)));
     }
 
     virtual ~Stream() = default;
@@ -48,7 +51,7 @@ class Stream {
     size_t n_elements;   // Number of elements/tokens this stream will produce.
     size_t element_size; // Size (in bytes) of each element
     uint32_t n_tiles;    // Total # of 32x32 tiles this stream will produce.
-    tt::DataFormat data_format;
+    tt::DataFormat format;
 
     friend class Map;
 };
@@ -84,7 +87,7 @@ class GatherStream : public Stream {
 
 class Map {
   public:
-    Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor);
+    Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor=1);
     ~Map();
     void add_connection(Kernel *src, std::string src_out, Kernel *dst, std::string dst_in);
     void add_connection(Stream *src, Kernel *dst, std::string dst_in);

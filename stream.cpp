@@ -416,6 +416,7 @@ std::string data_format_to_string(tt::DataFormat data_format) {
     switch (data_format) {
         case tt::DataFormat::Float16_b: return "DataFormat::Float16_b";
         case tt::DataFormat::Bfp8_b: return "DataFormat::Bfp8_b";
+        case tt::DataFormat::UInt32: return "DataFormat::UInt32";
         default:
             std::cerr << "Unsupported data format!\n";
             exit(1);
@@ -440,30 +441,52 @@ void Map::generate_reader_device_kernel(
 
     for (size_t i = 0; i < incoming_connections.size(); i++) {
         auto connection = incoming_connections[i];
+        auto port = kernel->get_input_port(connection.dest.port);
         if (connection.source.is_stream()) {
-            auto stream = streams[connection.source.index];
-            // Total # of tiles this kernel will read from this stream.
-            // Stream -> Kernel, get the input port index.
-            auto port = kernel->get_input_port(connection.dest.port);
-            rs << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
-            rs << "    DPRINT << \"READER0: " << port.name << "_ntiles: \" << " << port.name << "_ntiles << ENDL();\n";
-            total_args++;
-            // For every incoming stream connection, we need to get it's address and create an address generator.
-            rs << "    uint32_t " << port.name << "_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
-            rs << "    DPRINT << \"READER0: " << port.name << "_addr: \" << " << port.name << "_addr << ENDL();\n";
-            total_args++;
-            rs << "    uint32_t " << port.name << "_tile_offset = get_arg_val<uint32_t>(" << total_args << ");\n";
-            rs << "    DPRINT << \"READER0: " << port.name << "_tile_offset: \" << " << port.name << "_tile_offset << ENDL();\n";
-            total_args++;
-            // Address generator.
-            // TODO: Do we need this? How does this even work?
-            rs << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
-            rs << "        .bank_base_address = " << port.name << "_addr, \n";
-            rs << "        .page_size = " << TILE_WIDTH * TILE_HEIGHT * stream->element_size << ", \n";
-            rs << "        .data_format = " << data_format_to_string(stream->data_format) << ", \n";
-            rs << "    };\n\n";
+            if (streams[connection.source.index]->is_gather_stream()) {
+                auto *gather_stream = dynamic_cast<GatherStream*>(streams[connection.source.index]);
+                // Kernel args for index data should be the same as a normal stream.
+                rs << "    uint32_t " << port.name << "_index_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
+                rs << "    DPRINT << \"READER0: " << port.name << "_index_ntiles: \" << " << port.name << "_index_ntiles << ENDL();\n";
+                total_args++;
+                // For every incoming stream connection, we need to get it's address and create an address generator.
+                rs << "    uint32_t " << port.name << "_index_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
+                rs << "    DPRINT << \"READER0: " << port.name << "_index_addr: \" << " << port.name << "_index_addr << ENDL();\n";
+                total_args++;
+                // TODO: Handle offsets for gather streams.
+                // rs << "    uint32_t " << port.name << "_tile_offset = get_arg_val<uint32_t>(" << total_args << ");\n";
+                // rs << "    DPRINT << \"READER0: " << port.name << "_tile_offset: \" << " << port.name << "_tile_offset << ENDL();\n";
+                // total_args++;
+                // Address generator.
+                // TODO: Do we need this? How does this even work?
+                rs << "    const InterleavedAddrGenFast<true> " << port.name << "_index_addr_gen = {\n";
+                rs << "        .bank_base_address = " << port.name << "_index_addr, \n";
+                rs << "        .page_size = " << TILE_WIDTH * TILE_HEIGHT * gather_stream->element_size << ", \n";
+                rs << "        .data_format = " << data_format_to_string(gather_stream->format) << ", \n";
+                rs << "    };\n\n";
+            } else {
+                auto *stream = streams[connection.source.index];
+                // Total # of tiles this kernel will read from this stream.
+                // Stream -> Kernel, get the input port index.
+                rs << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
+                rs << "    DPRINT << \"READER0: " << port.name << "_ntiles: \" << " << port.name << "_ntiles << ENDL();\n";
+                total_args++;
+                // For every incoming stream connection, we need to get it's address and create an address generator.
+                rs << "    uint32_t " << port.name << "_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
+                rs << "    DPRINT << \"READER0: " << port.name << "_addr: \" << " << port.name << "_addr << ENDL();\n";
+                total_args++;
+                rs << "    uint32_t " << port.name << "_tile_offset = get_arg_val<uint32_t>(" << total_args << ");\n";
+                rs << "    DPRINT << \"READER0: " << port.name << "_tile_offset: \" << " << port.name << "_tile_offset << ENDL();\n";
+                total_args++;
+                // Address generator.
+                // TODO: Do we need this? How does this even work?
+                rs << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
+                rs << "        .bank_base_address = " << port.name << "_addr, \n";
+                rs << "        .page_size = " << TILE_WIDTH * TILE_HEIGHT * stream->element_size << ", \n";
+                rs << "        .data_format = " << data_format_to_string(stream->format) << ", \n";
+                rs << "    };\n\n";
+            }
         } else {
-            auto port = kernel->get_input_port(connection.dest.port);
             rs << "    uint32_t " << port.name << "_ntiles = get_arg_val<uint32_t>(" << total_args << ");\n";
             rs << "    DPRINT << \"READER1: " << port.name << "_ntiles: \" << " << port.name << "_ntiles << ENDL();\n";
             total_args++;
@@ -879,7 +902,7 @@ void Map::generate_writer_device_kernel(
             ws << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
             ws << "        .bank_base_address = " << port.name << "_addr, \n";
             ws << "        .page_size = " << TILE_WIDTH * TILE_HEIGHT * stream->element_size << ", \n";
-            ws << "        .data_format = " << data_format_to_string(stream->data_format) << ", \n";
+            ws << "        .data_format = " << data_format_to_string(stream->format) << ", \n";
             ws << "    };\n\n";
         } else {
             // TODO: Handle outgoing kernel connections.
