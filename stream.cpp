@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "host_api.hpp"
 #include "impl/buffers/buffer.hpp"
 #include "impl/buffers/circular_buffer_types.hpp"
 #include "common/work_split.hpp"
@@ -101,7 +102,7 @@ void Map::execute() {
 
     // 3. Input & Output DRAM buffer setup.
     for (size_t i = 0; i < streams.size(); i++) {
-        auto stream = streams[i];
+        auto *stream = streams[i];
         tt_metal::InterleavedBufferConfig config = {
             .device = runtime->device,
             .size = stream->n_elements * stream->element_size,
@@ -115,6 +116,26 @@ void Map::execute() {
         tt_metal::EnqueueWriteBuffer(runtime->device->command_queue(), stream->device_buffer, stream->host_data, true);
         stream->device_buffer_address = stream->device_buffer->address();
         stream->device_buffer_noc_coordinates = stream->device_buffer->noc_coordinates();
+
+        if (stream->is_gather_stream()) {
+            // Set up data buffer as well.
+            auto *gather_stream = dynamic_cast<GatherStream*>(stream);
+            // Note: assuming underlying data is already 32 byte aligned and accesses are padded.
+            auto total_size_bytes = gather_stream->data_buffer.size() * datum_size(gather_stream->data_format); 
+            tt_metal::InterleavedBufferConfig data_config = {
+                .device = runtime->device,
+                .size = total_size_bytes,
+                .page_size = total_size_bytes, // TODO: Random access doesn't work across pages, so we have page_size=total_size. Is this a problem?
+                .buffer_type = tt_metal::BufferType::DRAM,
+            };
+            gather_stream->data_buffer_device = tt_metal::CreateBuffer(data_config);
+            tt_metal::EnqueueWriteBuffer(runtime->device->command_queue(),
+                                          gather_stream->data_buffer_device,
+                                          gather_stream->data_buffer, 
+                                          true);
+            gather_stream->data_buffer_address = gather_stream->data_buffer_device->address();
+            gather_stream->data_buffer_noc_coordinates = gather_stream->data_buffer_device->noc_coordinates();
+        }
     }
 
     // 4. Generate device kernels.
