@@ -12,7 +12,7 @@ using namespace tt;
 
 namespace current {
 
-const std::filesystem::path GENERATED_KERNELS_PATH = "tt_metal/programming_examples/personal/current/kernels/generated";
+const std::filesystem::path GENERATED_KERNELS_PATH = "sources/examples/current/kernels/generated";
 
 using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
 
@@ -156,7 +156,6 @@ class Map {
     struct Runtime {
         tt_metal::Device *device;
         tt_metal::Program program;
-        uint32_t num_cores;
         uint32_t num_cores_x;
         uint32_t num_cores_y;
         tt_metal::CoreRangeSet core_set;
@@ -180,7 +179,7 @@ class Map {
         uint32_t n_tiles;
     };
 
-    Runtime runtime;
+    std::optional<Runtime> runtime;
     std::vector<Kernel *> kernels;
     std::vector<Stream *> streams;
     std::vector<Connection> connections;

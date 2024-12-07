@@ -1,6 +1,6 @@
 #pragma once
 
-#include "bfloat16.hpp"
+#include "common/bfloat16.hpp"
 
 // TODO: Need to determine when/how these will be set. 
 // I think I might want to keep this constant for a given runtime program graph.
@@ -15,6 +15,6 @@ constexpr uint32_t IN_CB_START = 0;
 constexpr uint32_t OUT_CB_START = 16;
 constexpr uint32_t MAX_INPUT_PORTS = 16;
 constexpr uint32_t MAX_OUTPUT_PORTS = 16;
-constexpr uint8_t MAX_PARALLELIZATION_FACTOR = 8; // Maximum number of cores that a kernel will be parallelized across.
+constexpr uint8_t MAX_PARALLELIZATION_FACTOR = 1; // Maximum number of cores that a kernel will be parallelized across.
 // constexpr uint32_t INVALID = 0;
 // constexpr uint32_t VALID = 1;

@@ -6,11 +6,9 @@
 #include <fstream>
 #include <vector>
 
-#include "common/bfloat16.hpp"
-#include "core_coord.hpp"
 #include "impl/buffers/buffer.hpp"
 #include "impl/buffers/circular_buffer_types.hpp"
-#include "work_split.hpp"
+#include "common/work_split.hpp"
 #include "tt_metal/impl/device/device.hpp"
 
 #include "common.hpp"
@@ -109,30 +107,39 @@ void Map::execute() {
     propagate_counts();
 
     // 1. Create device and program.
-    runtime.device = tt_metal::CreateDevice(0);
-    if (!runtime.device) {
+    auto device = tt_metal::CreateDevice(0);
+    if (!device) {
         std::cerr << "Failed to create device!\n";
         exit(1);
     }
-    runtime.program = tt_metal::CreateProgram();
+    auto program = tt_metal::CreateProgram();
 
     // 2. Core grid setup.
     // TODO: Have this configurable by user and dyanmic by runtime scheduling.
     // Write now just set to # of kernels we have.
     // runtime.num_cores = kernels.size();
-    auto compute_with_storage_grid_size = runtime.device->compute_with_storage_grid_size();
-    runtime.num_cores_x = compute_with_storage_grid_size.x;
-    runtime.num_cores_y = compute_with_storage_grid_size.y;
-    runtime.core_set = num_cores_to_corerangeset({0, 0}, kernels.size() * MAX_PARALLELIZATION_FACTOR, {runtime.num_cores_x, runtime.num_cores_y});
-    tt::log_info("[CURRENT] num_cores_x: {}, num_cores_y: {}", runtime.num_cores_x, runtime.num_cores_y);
-    tt::log_info("[CURRENT] core_set: {}", runtime.core_set.str());
-    tt::log_info("[CURRENT] Total cores: {}", runtime.core_set.num_cores());
+    auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
+    auto num_cores_x = compute_with_storage_grid_size.x;
+    auto num_cores_y = compute_with_storage_grid_size.y;
+    auto core_set = num_cores_to_corerange_set({0, 0}, kernels.size() * MAX_PARALLELIZATION_FACTOR, {num_cores_x, num_cores_y});
+
+    runtime.emplace(Runtime {
+        .device = device,
+        .program = std::move(program),
+        .num_cores_x = static_cast<uint32_t>(num_cores_x),
+        .num_cores_y = static_cast<uint32_t>(num_cores_y),
+        .core_set = std::move(core_set)
+    });
+
+    tt::log_info("[CURRENT] num_cores_x: {}, num_cores_y: {}", runtime->num_cores_x, runtime->num_cores_y);
+    tt::log_info("[CURRENT] core_set: {}", runtime->core_set.str());
+    tt::log_info("[CURRENT] Total cores: {}", runtime->core_set.num_cores());
 
     // 3. Input & Output DRAM buffer setup.
     for (size_t i = 0; i < streams.size(); i++) {
         auto stream = streams[i];
         tt_metal::InterleavedBufferConfig config = {
-            .device = runtime.device,
+            .device = runtime->device,
             .size = stream->n_elements * stream->element_size,
             .page_size = stream->element_size * TILE_WIDTH * TILE_HEIGHT, // TODO: Not sure what is optimal for this.
             .buffer_type = tt_metal::BufferType::DRAM
@@ -141,7 +148,7 @@ void Map::execute() {
         stream->device_buffer = tt_metal::CreateBuffer(config);
         // TODO: Does this need to be blocking?
         // TODO: What if there's a mismatch between the host data size and the device buffer size?
-        tt_metal::EnqueueWriteBuffer(runtime.device->command_queue(), stream->device_buffer, stream->host_data, true);
+        tt_metal::EnqueueWriteBuffer(runtime->device->command_queue(), stream->device_buffer, stream->host_data, true);
         stream->device_buffer_address = stream->device_buffer->address();
         stream->device_buffer_noc_coordinates = stream->device_buffer->noc_coordinates();
     }
@@ -150,7 +157,7 @@ void Map::execute() {
     generate_device_kernels();
 
     // Vector of cores we have availible to assign to kernels.
-    std::vector<CoreCoord> cores = corerange_to_cores(runtime.core_set);
+    std::vector<CoreCoord> cores = corerange_to_cores(runtime->core_set);
 
     auto total_cores = cores.size();
     std::cout << "Total cores: " << total_cores << std::endl;
@@ -191,9 +198,9 @@ void Map::execute() {
 
             // Create semaphores for each kernel.
             // TODO: Is overwriting across multiple cores, though we might not even need to store this ID for later.
-            kernel->sender_semaphore_id = tt_metal::CreateSemaphore(runtime.program, core, INVALID);
-            kernel->receiver_semaphore_id = tt_metal::CreateSemaphore(runtime.program, core, INVALID);
-            kernel->l1_valid_value_semaphore_id = tt_metal::CreateSemaphore(runtime.program, core, VALID);
+            kernel->sender_semaphore_id = tt_metal::CreateSemaphore(runtime->program, core, INVALID);
+            kernel->receiver_semaphore_id = tt_metal::CreateSemaphore(runtime->program, core, INVALID);
+            kernel->l1_valid_value_semaphore_id = tt_metal::CreateSemaphore(runtime->program, core, VALID);
 
             auto incoming_connections = get_incoming_connections(kernel);
             auto outgoing_connections = get_outgoing_connections(kernel);
@@ -210,7 +217,7 @@ void Map::execute() {
                     {{cb_index, input_port.data_format}}
                 ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
                 // TODO: Again, overwriting across multiple cores.
-                kernel->input_ports[input_port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, core, cb_config);
+                kernel->input_ports[input_port_index].cb = tt_metal::CreateCircularBuffer(runtime->program, core, cb_config);
 
                 // // Create mailbox buffer for incoming connections from another kernel.
                 // if (incoming_connections[i].source.is_kernel()) {
@@ -234,12 +241,12 @@ void Map::execute() {
                     {{cb_index, output_port.data_format}}
                 ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
                 // TODO: Again, overwriting across multiple cores.
-                kernel->output_ports[output_port_index].cb = tt_metal::CreateCircularBuffer(runtime.program, core, cb_config);
+                kernel->output_ports[output_port_index].cb = tt_metal::CreateCircularBuffer(runtime->program, core, cb_config);
             }
 
             // Create device kernels.
             auto reader = tt_metal::CreateKernel(
-                runtime.program,
+                runtime->program,
                 kernel->generated_reader_kernel_path,
                 core,
                 // TODO: Can also do compile-time args here? I think this might be useful.
@@ -262,13 +269,12 @@ void Map::execute() {
             // I haven’t heard about “TILE” mode, not sure if that’s used anywhere. 
             // HALF mode is most common and afaik expected to be the default.
             auto compute = tt_metal::CreateKernel(
-                runtime.program,
+                runtime->program,
                 kernel->generated_compute_kernel_path,
                 core,
                 ComputeConfig{
                     // TODO: Also need to figure out what the heck to do for this.
                     .math_fidelity = MathFidelity::LoFi,
-                    .dst_full_sync_en = false, // Don't know what this is lol
                     .math_approx_mode = false,
                     .compile_args = {},
                     .defines = {}
@@ -277,7 +283,7 @@ void Map::execute() {
             kernel->compute_kernel = compute;
 
             auto writer = tt_metal::CreateKernel(
-                runtime.program,
+                runtime->program,
                 kernel->generated_writer_kernel_path,
                 core,
                 DataMovementConfig {
@@ -308,8 +314,8 @@ void Map::execute() {
                     // TODO: I'm not sure if this is correct with the way I'm doing parallelization. Would make more sense to transform the program graph itself.
                     auto sender = kernels[connection.source.index];
                     CoreCoord sender_core = sender->core_spec[j];
-                    uint32_t sender_x = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).x;
-                    uint32_t sender_y = (uint32_t)runtime.device->worker_core_from_logical_core(sender_core).y;
+                    uint32_t sender_x = (uint32_t)runtime->device->worker_core_from_logical_core(sender_core).x;
+                    uint32_t sender_y = (uint32_t)runtime->device->worker_core_from_logical_core(sender_core).y;
                     reader_args.push_back(n_tiles);
                     reader_args.push_back(sender_x);
                     reader_args.push_back(sender_y);
@@ -319,8 +325,8 @@ void Map::execute() {
                     compute_args.push_back(n_tiles);
                 }
             }
-            SetRuntimeArgs(runtime.program, kernel->reader_kernel, core, reader_args);
-            SetRuntimeArgs(runtime.program, kernel->compute_kernel, core, compute_args);
+            SetRuntimeArgs(runtime->program, kernel->reader_kernel, core, reader_args);
+            SetRuntimeArgs(runtime->program, kernel->compute_kernel, core, compute_args);
 
             std::vector<uint32_t> writer_args;
             for (const auto& connection : outgoing_connections) {
@@ -338,8 +344,8 @@ void Map::execute() {
                     // Outgoing connection is another kernel.
                     auto receiver = kernels[connection.dest.index];
                     CoreCoord receiver_core = receiver->core_spec[j];
-                    uint32_t receiver_x = (uint32_t)runtime.device->worker_core_from_logical_core(receiver_core).x;
-                    uint32_t receiver_y = (uint32_t)runtime.device->worker_core_from_logical_core(receiver_core).y;
+                    uint32_t receiver_x = (uint32_t)runtime->device->worker_core_from_logical_core(receiver_core).x;
+                    uint32_t receiver_y = (uint32_t)runtime->device->worker_core_from_logical_core(receiver_core).y;
                     uint32_t receiver_mailbox_addr = kernel->get_input_port(connection.dest.port).mailbox->address();
                     writer_args.push_back(n_tiles);
                     writer_args.push_back(receiver_x);
@@ -350,14 +356,14 @@ void Map::execute() {
                     writer_args.push_back(kernel->l1_valid_value_semaphore_id);
                 }
             }
-            SetRuntimeArgs(runtime.program, kernel->writer_kernel, core, writer_args);
+            SetRuntimeArgs(runtime->program, kernel->writer_kernel, core, writer_args);
         }
     }
 
     // Collect benchmark metrics.
     auto start = std::chrono::high_resolution_clock::now();
-    tt_metal::EnqueueProgram(runtime.device->command_queue(), runtime.program, false);
-    tt_metal::Finish(runtime.device->command_queue());
+    tt_metal::EnqueueProgram(runtime->device->command_queue(), runtime->program, false);
+    tt_metal::Finish(runtime->device->command_queue());
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     tt::log_info("[CURRENT] Program execution completed! Time taken: {} milliseconds", duration.count());
@@ -369,7 +375,9 @@ void Map::execute() {
 }
 
 Map::~Map() {
-    tt_metal::CloseDevice(runtime.device);
+    if (runtime) {
+        tt_metal::CloseDevice(runtime->device);
+    }
 }
 
 bool Map::has_incoming_connection(Kernel *kernel) {
@@ -653,10 +661,10 @@ void Map::generate_compute_device_kernel(
     if (!kernel->sfpi_kernel_string.empty()) {
         // TODO: Do a better optimization if we don't have a compute kernel.
         // Can probably avoid any call to the sfpi function, don't need to do sfpi init? idk
-        cs << "    for (int i = 0; i < 16; i++) {\n";
+        cs << "    for (int i = 0; i < 32; i++) {\n";
         // Get input variables.
         for (size_t i = 0; i < incoming_connections.size(); i++) {
-            cs << "        vFloat in" << i << " = dst_reg[" << i << " * 16 + i];\n";
+            cs << "        vFloat in" << i << " = dst_reg[" << i << " * 32 + i];\n";
         }
         // Declare output variables.
         for (size_t i = 0; i < outgoing_connections.size(); i++) {
@@ -665,7 +673,7 @@ void Map::generate_compute_device_kernel(
         cs << kernel->sfpi_kernel_string;
         // Assign output variables.
         for (size_t i = 0; i < outgoing_connections.size(); i++) {
-            cs << "        dst_reg[" << i << " * 16 + i] = out" << i << ";\n";
+            cs << "        dst_reg[" << i << " * 32 + i] = out" << i << ";\n";
         }
         cs << "    }\n";
 
@@ -1181,7 +1189,7 @@ std::vector<uint32_t> Map::read_stream(Stream *stream) {
     assert(is_output && "Cannot get output from a stream that isn't a destination!");
 
     std::vector<uint32_t> out;
-    tt_metal::EnqueueReadBuffer(runtime.device->command_queue(), stream->device_buffer, out, true);
+    tt_metal::EnqueueReadBuffer(runtime->device->command_queue(), stream->device_buffer, out, true);
     return out;
 }
 
