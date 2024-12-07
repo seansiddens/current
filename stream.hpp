@@ -3,6 +3,7 @@
 #include <vector>
 #include <filesystem>
 
+#include "common/tt_backend_api_types.hpp"
 #include "impl/buffers/buffer.hpp"
 #include "tt_metal/host_api.hpp"
 
@@ -28,8 +29,11 @@ class Stream {
         this->n_tiles = std::ceil(n_elements / TILE_SIZE);
     }
 
-  private:
-    friend class Map;
+    virtual ~Stream() = default;
+
+    [[nodiscard]] virtual bool is_gather_stream() const { return false; }
+
+  protected:
     // Corresponding host data for the buffer. 
     // If this is a source, then the host will initialize this data and the runtime will copy it to the device.
     // If this is a sink, then the runtime will read data from the device into this buffer for the host to read.
@@ -43,6 +47,29 @@ class Stream {
     size_t element_size; // Size (in bytes) of each element
     uint32_t n_tiles;    // Total # of 32x32 tiles this stream will produce.
     tt::DataFormat data_format;
+
+    friend class Map;
+};
+
+class GatherStream : public Stream {
+  public: 
+    GatherStream(const std::vector<uint32_t>& data_buffer, 
+                 tt::DataFormat data_format,
+                 const std::vector<uint32_t>& index_data)
+                 : Stream(index_data, index_data.size(), tt::DataFormat::UInt32), data_buffer(data_buffer), data_format(data_format) {
+    }
+
+    [[nodiscard]] bool is_gather_stream() const override { return true; }
+
+
+  private:
+    std::vector<uint32_t> data_buffer;
+    std::shared_ptr<tt_metal::Buffer> data_buffer_device;
+    uint32_t data_buffer_address;
+    tt_metal::CoreCoord data_buffer_noc_coordinates;
+    tt::DataFormat data_format;
+
+    friend class Map;
 };
 
 class Kernel {
@@ -132,7 +159,7 @@ class Kernel {
 
 class Map {
   public:
-    Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams);
+    Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor);
     ~Map();
     void add_connection(Kernel *src, std::string src_out, Kernel *dst, std::string dst_in);
     void add_connection(Stream *src, Kernel *dst, std::string dst_in);
@@ -179,6 +206,7 @@ class Map {
         uint32_t n_tiles;
     };
 
+    uint32_t max_parallelization_factor;
     std::optional<Runtime> runtime;
     std::vector<Kernel *> kernels;
     std::vector<Stream *> streams;

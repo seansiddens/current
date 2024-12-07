@@ -4,6 +4,7 @@
 #include <iostream>
 #include <sstream>
 #include <fstream>
+#include <utility>
 #include <vector>
 
 #include "impl/buffers/buffer.hpp"
@@ -55,7 +56,8 @@ uint32_t Kernel::num_output_ports() const {
     return output_ports.size();
 }
 
-Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams) : kernels(kernels), streams(streams) {
+Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor) 
+    : kernels(std::move(kernels)), streams(streams), max_parallelization_factor(max_parallelization_factor) {
     // Check that all streams have the same number of elements.
     for (size_t i = 1; i < streams.size(); i++) {
         // TODO: Eventually we want to support streams of different sizes e.g for reduction kernels,
@@ -121,7 +123,7 @@ void Map::execute() {
     auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
     auto num_cores_x = compute_with_storage_grid_size.x;
     auto num_cores_y = compute_with_storage_grid_size.y;
-    auto core_set = num_cores_to_corerange_set({0, 0}, kernels.size() * MAX_PARALLELIZATION_FACTOR, {num_cores_x, num_cores_y});
+    auto core_set = num_cores_to_corerange_set({0, 0}, kernels.size() * max_parallelization_factor, {num_cores_x, num_cores_y});
 
     runtime.emplace(Runtime {
         .device = device,
@@ -159,6 +161,7 @@ void Map::execute() {
     // Vector of cores we have availible to assign to kernels.
     std::vector<CoreCoord> cores = corerange_to_cores(runtime->core_set);
 
+    // TODO: Bug with this when parallelizatino factor is not a multiple of num tiles??? Some sort of workload split bug.
     auto total_cores = cores.size();
     std::cout << "Total cores: " << total_cores << std::endl;
     size_t cores_used = 0;
@@ -169,7 +172,7 @@ void Map::execute() {
         // possibly doing automatic parallelization of kernels.
         // NOTE: This also requires that we need as many cores as kernels.
         size_t cores_availible = total_cores - cores_used;
-        size_t cores_to_assign = std::min(cores_availible, (size_t)MAX_PARALLELIZATION_FACTOR);
+        size_t cores_to_assign = std::min(cores_availible, (size_t)max_parallelization_factor);
 
         std::vector<CoreCoord> kernel_cores;
         for (size_t j = 0; j < cores_to_assign; j++) {

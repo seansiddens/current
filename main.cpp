@@ -189,7 +189,8 @@ int main(int argc, char **argv) {
 
     // Define connections between streams and kernels.
     // TODO: Segfaults if we add an extra kernel and don't connect it to anything.
-    current::Map map({&kernel_a}, {&source0, &source1,  &sink});
+    auto max_parallelization_factor = 1;
+    current::Map map({&kernel_a}, {&source0, &source1,  &sink}, max_parallelization_factor);
     map.add_connection(&source0, &kernel_a, "in0");
     map.add_connection(&source1, &kernel_a, "in1");
     // map.add_connection(&source2, &kernel_a, "in2");
