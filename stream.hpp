@@ -3,6 +3,7 @@
 #include <vector>
 #include <filesystem>
 
+#include "common/bfloat16.hpp"
 #include "common/tt_backend_api_types.hpp"
 #include "impl/buffers/buffer.hpp"
 #include "tt_metal/host_api.hpp"
@@ -60,16 +61,34 @@ class GatherStream : public Stream {
   public: 
     GatherStream(const std::vector<uint32_t>& data_buffer, 
                  tt::DataFormat data_format,
+                 uint32_t n_elements,
                  const std::vector<uint32_t>& index_data)
                  : Stream(index_data, index_data.size(), tt::DataFormat::UInt32), data_format(data_format) {
         // auto n_elements = (data_buffer.size() * sizeof(data_buffer[0])) / datum_size(this->data_format);
-        this->data_buffer.resize(data_buffer.size() * 8); // Every data element needs to be 32-byte aligned (8 u32s).
-        for (size_t i = 0; i < this->data_buffer.size(); i++) {
-            // size_t idx = static_cast<uint32_t>(i) & ~7U; // Clears 3 LSBs, rounding down to nearest multiple of 8.
-            size_t idx = static_cast<uint32_t>(i / 8U);
-            this->data_buffer[i] = data_buffer[idx];
-            // std::cout << "data_buf " << i << ": " << this->data_buffer[i] << "\n";
+        this->n_elements = n_elements;
+        if (data_format == tt::DataFormat::Float16_b) {
+          std::vector<bfloat16> in(n_elements * 16, bfloat16(0.0F));
+          std::vector<bfloat16> initial_data = unpack_uint32_vec_into_bfloat16_vec(data_buffer);
+          std::cout << "Initial data size: " << initial_data.size() << "\n";
+          for (size_t i = 0; i < in.size(); i++) {
+            in[i] = initial_data[i / 16];
+          }
+          this->data_buffer = pack_bfloat16_vec_into_uint32_vec(in);
+          std::cout << "Scaled data buffer: " << this->data_buffer.size() << "\n";
+        } else {
+          assert(false && "Unsupported data type for gather stream!\n");
         }
+        // auto factor = 32 / datum_size(data_format);
+        // this->data_buffer.resize(data_buffer.size() * 8); // Every data element needs to be 32-byte aligned (8 u32s).
+        // for (size_t i = 0; i < this->data_buffer.size(); i++) {
+        //     // size_t idx = static_cast<uint32_t>(i) & ~7U; // Clears 3 LSBs, rounding down to nearest multiple of 8.
+        //     size_t idx = static_cast<uint32_t>(i / 8U);
+        //     this->data_buffer[i] = data_buffer[idx];
+        // }
+        // auto foo = unpack_uint32_vec_into_bfloat16_vec(this->data_buffer);
+        // for (size_t i = 0; i < foo.size(); i++) {
+        //   std::cout << i << ": " << foo[i].to_float() << "\n";
+        // }
     }
 
     [[nodiscard]] bool is_gather_stream() const override { return true; }
@@ -81,6 +100,7 @@ class GatherStream : public Stream {
     uint32_t data_buffer_address;
     tt_metal::CoreCoord data_buffer_noc_coordinates;
     tt::DataFormat data_format;
+    uint32_t n_elements;
 
     friend class Map;
 };
@@ -96,6 +116,7 @@ class Map {
     void generate_device_kernels();
     void check_connections();
     std::vector<uint32_t> read_stream(Stream *stream);
+    std::vector<uint32_t> read_gather_stream(Stream *stream, bool read_data);
     void parallelize(std::vector<CoreCoord> &cores);
 
     // Visualize the work graph.
