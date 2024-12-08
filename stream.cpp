@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "common/tt_backend_api_types.hpp"
+#include "detail/tt_metal.hpp"
 #include "host_api.hpp"
 #include "impl/buffers/buffer.hpp"
 #include "impl/buffers/circular_buffer_types.hpp"
@@ -20,6 +21,9 @@
 namespace current {
 
 
+inline int get_tt_npu_clock(tt::tt_metal::Device *device) {
+    return tt::Cluster::instance().get_device_aiclk(device->id());
+}
 
 Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor) 
     : kernels(std::move(kernels)), streams(streams), max_parallelization_factor(max_parallelization_factor) {
@@ -383,17 +387,19 @@ void Map::execute() {
         }
     }
 
+    tt_metal::detail::CompileProgram(runtime->device, runtime->program);
+
     // Collect benchmark metrics.
-    auto start = std::chrono::high_resolution_clock::now();
-    tt_metal::EnqueueProgram(runtime->device->command_queue(), runtime->program, true);
+    auto start = std::chrono::steady_clock::now();
+    tt_metal::EnqueueProgram(runtime->device->command_queue(), runtime->program, false);
     tt_metal::Finish(runtime->device->command_queue());
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    tt::log_info("[CURRENT] Program execution completed! Time taken: {} milliseconds", duration.count());
-    auto total_bytes = streams[0]->n_elements * streams[0]->element_size;
-    tt::log_info("[CURRENT] Total bytes transferred: {}", total_bytes);
-    double total_seconds = duration.count() / 1000.0;
-    tt::log_info("[CURRENT] Total throughput: {} GB/s", (total_bytes / total_seconds) / 1e9);
+    auto end = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    tt::log_info("[CURRENT] Program execution completed! Time taken: {}us", duration.count());
+    // auto total_bytes = streams[0]->n_elements * streams[0]->element_size;
+    // tt::log_info("[CURRENT] Total bytes transferred: {}", total_bytes);
+    // double total_seconds = duration.count() / 1000.0;
+    // tt::log_info("[CURRENT] Total throughput: {} GB/s", (total_bytes / total_seconds) / 1e9);
     // tt_metal::CloseDevice(runtime.device);
 }
 
