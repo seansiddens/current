@@ -262,8 +262,8 @@ void Map::execute() {
                 core,
                 // TODO: Can also do compile-time args here? I think this might be useful.
                 DataMovementConfig {
-                    .processor = DataMovementProcessor::RISCV_1, 
-                    .noc = NOC::RISCV_1_default,
+                    .processor = DataMovementProcessor::RISCV_0, 
+                    .noc = NOC::RISCV_0_default,
                     .compile_args = {},
                     .defines = {}
                 } // TODO: What to do for this?
@@ -300,8 +300,8 @@ void Map::execute() {
                 kernel->generated_writer_kernel_path,
                 core,
                 DataMovementConfig {
-                    .processor = DataMovementProcessor::RISCV_0,
-                    .noc = NOC::RISCV_0_default,
+                    .processor = DataMovementProcessor::RISCV_1,
+                    .noc = NOC::RISCV_1_default,
                     .compile_args = {},
                     .defines = {}
                 }
