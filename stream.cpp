@@ -127,7 +127,8 @@ void Map::execute() {
             // Set up data buffer as well.
             auto *gather_stream = dynamic_cast<GatherStream*>(stream);
             // Note: assuming underlying data is already 32 byte aligned and accesses are padded.
-            auto total_size_bytes = gather_stream->n_elements * datum_size(gather_stream->data_format) * 32;
+            // auto total_size_bytes = gather_stream->n_elements * datum_size(gather_stream->data_format) * 32;
+            auto total_size_bytes = gather_stream->data_buffer.size() * 4;
             std::cout << "data gather stream page size & total size: " << total_size_bytes << "\n";
             tt_metal::InterleavedBufferConfig data_config = {
                 .device = runtime->device,
@@ -325,16 +326,18 @@ void Map::execute() {
                         compute_args.push_back(n_tiles); // Compute also needs to know how many tiles to read in.
                     } else {
                         auto *gather_stream = dynamic_cast<GatherStream*>(stream);
+                        // n_tiles = gather_stream->data_n_tiles / parallelization_factor;
                         // # of index tiles.
-                        reader_args.push_back(gather_stream->n_tiles); // TODO: Not accounting for parallelization.
+                        reader_args.push_back(n_tiles); // TODO: Not accounting for parallelization.
                         // Address of index buffer.
                         reader_args.push_back(gather_stream->device_buffer_address); 
+                        reader_args.push_back(tile_offset);
                         // Address of data buffer.
                         reader_args.push_back(gather_stream->data_buffer_address); 
                         // Data buffer noc coordinates.
                         reader_args.push_back(gather_stream->data_buffer_noc_coordinates.x);
                         reader_args.push_back(gather_stream->data_buffer_noc_coordinates.y);
-                        compute_args.push_back(gather_stream->n_tiles); // TODO: Not accounting for paralleization.
+                        compute_args.push_back(n_tiles); // TODO: Not accounting for paralleization.
                     }
                 } else {
                     // Incoming connection is another kernel. 
@@ -498,9 +501,9 @@ void Map::generate_reader_device_kernel(
                 rs << "    DPRINT << \"READER0: " << port.name << "_addr: \" << " << port.name << "_addr << ENDL();\n";
                 total_args++;
                 // TODO: Handle offsets for gather streams.
-                // rs << "    uint32_t " << port.name << "_tile_offset = get_arg_val<uint32_t>(" << total_args << ");\n";
-                // rs << "    DPRINT << \"READER0: " << port.name << "_tile_offset: \" << " << port.name << "_tile_offset << ENDL();\n";
-                // total_args++;
+                rs << "    uint32_t " << port.name << "_tile_offset = get_arg_val<uint32_t>(" << total_args << ");\n";
+                rs << "    DPRINT << \"READER0: " << port.name << "_tile_offset: \" << " << port.name << "_tile_offset << ENDL();\n";
+                total_args++;
                 // Address generator.
                 // TODO: Do we need this? How does this even work?
                 rs << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
@@ -650,7 +653,7 @@ void Map::generate_reader_device_kernel(
                 auto *gather_stream = dynamic_cast<GatherStream*>(stream);
                 // Gather stream, fetch index data from DRAM to intermed CB
                 rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
-                rs << "            uint32_t id = " << port.name << "_count;\n";
+                rs << "            uint32_t id = "<< port.name << "_tile_offset + " << port.name << "_count;\n";
                 rs << "            DPRINT << \"READER0: id: \" << id << ENDL();\n";
                 rs << "            noc_async_read_tile(id, " <<  port.name << "_addr_gen, " << port.name << "_indices_write_ptr);\n";
                 rs << "        }\n";

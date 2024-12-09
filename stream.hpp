@@ -61,13 +61,13 @@ class GatherStream : public Stream {
   public: 
     GatherStream(const std::vector<uint32_t>& data_buffer, 
                  tt::DataFormat data_format,
-                 uint32_t n_elements,
+                 uint32_t n_elements_,
                  const std::vector<uint32_t>& index_data)
                  : Stream(index_data, index_data.size(), tt::DataFormat::UInt32), data_format(data_format) {
         // auto n_elements = (data_buffer.size() * sizeof(data_buffer[0])) / datum_size(this->data_format);
-        this->n_elements = n_elements;
+        this->data_n_elements = n_elements_;
         if (data_format == tt::DataFormat::Float16_b) {
-          std::vector<bfloat16> in(n_elements * 16, bfloat16(0.0F));
+          std::vector<bfloat16> in(data_n_elements * 16, bfloat16(0.0F));
           std::vector<bfloat16> initial_data = unpack_uint32_vec_into_bfloat16_vec(data_buffer);
           std::cout << "Initial data size: " << initial_data.size() << "\n";
           for (size_t i = 0; i < in.size(); i++) {
@@ -89,6 +89,9 @@ class GatherStream : public Stream {
         // for (size_t i = 0; i < foo.size(); i++) {
         //   std::cout << i << ": " << foo[i].to_float() << "\n";
         // }
+        this->data_n_tiles = static_cast<uint32_t>(std::ceil(this->data_n_elements / static_cast<double>(TILE_SIZE)));
+        std::cout << "Gather data n_elements: " << this->data_n_elements << "\n";
+        std::cout << "Gather data n_tiles: " << this->data_n_tiles << "\n";
     }
 
     [[nodiscard]] bool is_gather_stream() const override { return true; }
@@ -100,7 +103,8 @@ class GatherStream : public Stream {
     uint32_t data_buffer_address;
     tt_metal::CoreCoord data_buffer_noc_coordinates;
     tt::DataFormat data_format;
-    uint32_t n_elements;
+    uint32_t data_n_elements;
+    uint32_t data_n_tiles;
 
     friend class Map;
 };
