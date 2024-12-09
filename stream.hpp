@@ -107,7 +107,7 @@ class GatherStream : public Stream {
 
 class Map {
   public:
-    Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor=1);
+    Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor=1, uint32_t tiles_per_cb=1);
     ~Map();
     void add_connection(Kernel *src, std::string src_out, Kernel *dst, std::string dst_in);
     void add_connection(Stream *src, Kernel *dst, std::string dst_in);
@@ -156,6 +156,7 @@ class Map {
     };
 
     uint32_t max_parallelization_factor;
+    uint32_t tiles_per_cb;
     std::optional<Runtime> runtime;
     std::vector<Kernel *> kernels;
     std::vector<Stream *> streams;

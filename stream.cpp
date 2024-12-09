@@ -25,8 +25,8 @@ inline int get_tt_npu_clock(tt::tt_metal::Device *device) {
     return tt::Cluster::instance().get_device_aiclk(device->id());
 }
 
-Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor) 
-    : kernels(std::move(kernels)), streams(streams), max_parallelization_factor(max_parallelization_factor) {
+Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor, uint32_t tiles_per_cb) 
+    : kernels(std::move(kernels)), streams(streams), max_parallelization_factor(max_parallelization_factor), tiles_per_cb(tiles_per_cb) {
     // Check that all streams have the same number of elements.
     for (size_t i = 1; i < streams.size(); i++) {
         // TODO: Eventually we want to support streams of different sizes e.g for reduction kernels,
@@ -207,7 +207,7 @@ void Map::execute() {
                 auto input_port_index = kernel->get_input_port_index(input_port.name);
                 auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(input_port.data_format);
                 tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
-                    TILES_PER_CB * tile_size_bytes,
+                    tiles_per_cb * tile_size_bytes,
                     {{cb_index, input_port.data_format}}
                 ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
                 // TODO: Again, overwriting across multiple cores.
@@ -220,7 +220,7 @@ void Map::execute() {
                         auto intermed_cb_index = k + INTERMED_CB_START;
                         auto index_tile_size_bytes = TILE_SIZE * sizeof(uint32_t);
                         tt_metal::CircularBufferConfig index_cb_config = CircularBufferConfig(
-                            TILES_PER_CB * index_tile_size_bytes,
+                            tiles_per_cb * index_tile_size_bytes,
                             {{intermed_cb_index, tt::DataFormat::UInt32}}
                         ).set_page_size(intermed_cb_index, index_tile_size_bytes); // TODO: Not sure what to set this page size to.
                         // TODO: Does this handle even need to be stored anywhere?
@@ -247,7 +247,7 @@ void Map::execute() {
                 auto output_port_index = kernel->get_output_port_index(output_port.name);
                 auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(output_port.data_format);
                 tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
-                    TILES_PER_CB * tile_size_bytes,
+                    tiles_per_cb * tile_size_bytes,
                     {{cb_index, output_port.data_format}}
                 ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
                 // TODO: Again, overwriting across multiple cores.
@@ -262,8 +262,8 @@ void Map::execute() {
                 core,
                 // TODO: Can also do compile-time args here? I think this might be useful.
                 DataMovementConfig {
-                    .processor = DataMovementProcessor::RISCV_0, 
-                    .noc = NOC::RISCV_0_default,
+                    .processor = DataMovementProcessor::RISCV_1, 
+                    .noc = NOC::RISCV_1_default,
                     .compile_args = {},
                     .defines = {}
                 } // TODO: What to do for this?
@@ -300,8 +300,8 @@ void Map::execute() {
                 kernel->generated_writer_kernel_path,
                 core,
                 DataMovementConfig {
-                    .processor = DataMovementProcessor::RISCV_1,
-                    .noc = NOC::RISCV_1_default,
+                    .processor = DataMovementProcessor::RISCV_0,
+                    .noc = NOC::RISCV_0_default,
                     .compile_args = {},
                     .defines = {}
                 }
