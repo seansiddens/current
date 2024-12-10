@@ -157,23 +157,24 @@ void Map::execute() {
     // 3. Input & Output DRAM buffer setup.
     for (size_t i = 0; i < streams.size(); i++) {
         auto *stream = streams[i];
-        tt_metal::InterleavedBufferConfig config = {
-            .device = runtime->device,
-            .size = stream->n_elements * stream->element_size,
-            .page_size = stream->element_size * TILE_WIDTH * TILE_HEIGHT, // TODO: Not sure what is optimal for this.
-            .buffer_type = tt_metal::BufferType::DRAM
-        };
-        std::cout << "STREAM " << i << ": size: " << config.size << std::endl;
-        stream->device_buffer = tt_metal::CreateBuffer(config);
-        // TODO: Does this need to be blocking?
-        // TODO: What if there's a mismatch between the host data size and the device buffer size?
-        tt_metal::EnqueueWriteBuffer(runtime->device->command_queue(), stream->device_buffer, stream->host_data, true);
-        stream->device_buffer_address = stream->device_buffer->address();
-        stream->device_buffer_noc_coordinates = stream->device_buffer->noc_coordinates();
-
         if (stream->is_gather_stream()) {
-            // Set up data buffer as well.
             auto *gather_stream = dynamic_cast<GatherStream*>(stream);
+            // Index buffer.
+            tt_metal::InterleavedBufferConfig config = {
+                .device = runtime->device,
+                .size = gather_stream->n_elements * gather_stream->element_size,
+                .page_size = stream->element_size * TILE_WIDTH * TILE_HEIGHT * gather_stream->accesses_per_token, // We fetch n indices for every n accesses, so index tile has to be n times larger.
+                .buffer_type = tt_metal::BufferType::DRAM
+            };
+            std::cout << "STREAM " << i << ": size: " << config.size << std::endl;
+            gather_stream->device_buffer = tt_metal::CreateBuffer(config);
+            // TODO: Does this need to be blocking?
+            // TODO: What if there's a mismatch between the host data size and the device buffer size?
+            tt_metal::EnqueueWriteBuffer(runtime->device->command_queue(), gather_stream->device_buffer, gather_stream->host_data, true);
+            gather_stream->device_buffer_address = gather_stream->device_buffer->address();
+            gather_stream->device_buffer_noc_coordinates = gather_stream->device_buffer->noc_coordinates();
+
+            // Set up data buffer as well.
             if (!gather_stream->use_sram) {
                 // Note: assuming underlying data is already 32 byte aligned and accesses are padded.
                 auto total_size_bytes = gather_stream->data_buffer.size() * 4;
@@ -207,6 +208,20 @@ void Map::execute() {
                 gather_stream->data_buffer_address = gather_stream->data_buffer_device->address();
                 gather_stream->data_buffer_noc_coordinates = gather_stream->data_buffer_device->noc_coordinates();
             }
+        } else {
+            tt_metal::InterleavedBufferConfig config = {
+                .device = runtime->device,
+                .size = stream->n_elements * stream->element_size,
+                .page_size = stream->element_size * TILE_WIDTH * TILE_HEIGHT, // TODO: Not sure what is optimal for this.
+                .buffer_type = tt_metal::BufferType::DRAM
+            };
+            std::cout << "STREAM " << i << ": size: " << config.size << std::endl;
+            stream->device_buffer = tt_metal::CreateBuffer(config);
+            // TODO: Does this need to be blocking?
+            // TODO: What if there's a mismatch between the host data size and the device buffer size?
+            tt_metal::EnqueueWriteBuffer(runtime->device->command_queue(), stream->device_buffer, stream->host_data, true);
+            stream->device_buffer_address = stream->device_buffer->address();
+            stream->device_buffer_noc_coordinates = stream->device_buffer->noc_coordinates();
         }
     }
 
@@ -278,6 +293,8 @@ void Map::execute() {
                     auto intermed_cb_index = num_intermed_cbs + INTERMED_CB_START;
                     num_intermed_cbs++;
                     auto index_tile_size_bytes = TILE_SIZE * sizeof(uint32_t) * stream->accesses_per_token;
+                    // auto index_tile_size_bytes = TILE_SIZE * sizeof(uint32_t);
+                    std::cout << "Index CB tile size bytes: " << index_tile_size_bytes << "\n";
                     tt_metal::CircularBufferConfig index_cb_config = CircularBufferConfig(
                         tiles_per_cb * index_tile_size_bytes,
                         {{intermed_cb_index, tt::DataFormat::UInt32}}
@@ -404,7 +421,7 @@ void Map::execute() {
                         compute_args.push_back(n_tiles); // Compute also needs to know how many tiles to read in.
                     } else {
                         auto *gather_stream = dynamic_cast<GatherStream*>(stream);
-                        n_tiles *= gather_stream->accesses_per_token; // TODO: I HAVE NO IDEA IF THIS SHIT WORKS LMAO
+                        // n_tiles *= gather_stream->accesses_per_token; // TODO: I HAVE NO IDEA IF THIS SHIT WORKS LMAO
                         std::cout << "Gather stream index n_tiles: " << n_tiles << "\n";
                         // n_tiles = gather_stream->data_n_tiles / parallelization_factor;
                         // # of index tiles.
@@ -588,7 +605,7 @@ void Map::generate_reader_device_kernel(
                 // TODO: Do we need this? How does this even work?
                 rs << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
                 rs << "        .bank_base_address = " << port.name << "_addr, \n";
-                rs << "        .page_size = " << TILE_WIDTH * TILE_HEIGHT * gather_stream->element_size << ", \n";
+                rs << "        .page_size = " << std::to_string(TILE_WIDTH * TILE_HEIGHT * gather_stream->element_size * gather_stream->accesses_per_token) << ", \n";
                 rs << "        .data_format = " << data_format_to_string(gather_stream->format) << ", \n";
                 rs << "    };\n\n";
 
@@ -1106,33 +1123,49 @@ void Map::generate_compute_device_kernel(
             cs << "        cb_pop_front(" << kernel->get_input_port(incoming_connections[i].dest.port).name << ", 1);\n";
         }
     } else {
+        num_input_cbs = IN_CB_START;
         for (size_t i = 0; i < incoming_connections.size(); i++) {
-            // auto port = kernel->get_input_port(incoming_connections[incoming_connections.size() - i - 1].dest.port);
-            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
-            /**
-            * Copies a single tile from the specified input CB and writes the result to
-            * DST at a specified index. The function will employ unpacker to first unpack into SRC
-            * registers and then perform move into DST registers, at a specified index.
-            * For the in_tile_index to be valid for this call, cb_wait_front(n) had to be
-            * previously called to ensure that at least some number n>0 of tiles are available
-            * in the input CB. The CB index 0 then references the first tile in the received section of the CB,
-            * up to index n-1 (in a FIFO order). The DST register buffer must be in acquired state via
-            * acquire_dst call. This call is blocking and is only available on the compute
-            * engine.
-            *
-            * Return value: None
-            *
-            * | Argument       | Description                                       | Data type | Valid range                                         | required |
-            * |----------------|---------------------------------------------------|-----------|-----------------------------------------------------|----------|
-            * | in_cb_id       | The identifier of the source circular buffer (CB) | uint32_t  | 0 to 31                                             | Yes      |
-            * | in_tile_index  | The index of the tile to copy from the input CB   | uint32_t  | Must be less than the size of the CB                | Yes      |
-            * | dst_tile_index | The index of the tile in the DST register         | uint32_t  | Must be less than the size of the DST register (16) | Yes      |
-            * */
-            // cs << "        copy_tile(" << port.name << ", 0, " << incoming_connections.size() - i - 1 << ");\n";
-            cs << "        copy_tile(" << port.name << ", 0, " << i << ");\n";
-            // cs << "        UNPACK(( llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(" << port.name << ", 0)  ));\n";
-            // TODO: Not sure how this works in the context of the compute cores. Which core is doing this pop?
-            cs << "        cb_pop_front(" << port.name << ", 1);\n";
+            auto conn = incoming_connections[i];
+            if (conn.source.is_stream() && streams[conn.source.index]->is_gather_stream()) {
+                auto *stream = dynamic_cast<GatherStream*>(streams[conn.source.index]);
+                auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+                for (size_t access = 0; access < stream->accesses_per_token; access++) {
+                    std::string in_cb_name = port.name + "_" + std::to_string(access);
+                    cs << "        copy_tile(" << in_cb_name << ", 0, " << num_input_cbs << ");\n";
+                    // cs << "        UNPACK(( llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(" << port.name << ", 0)  ));\n";
+                    // TODO: Not sure how this works in the context of the compute cores. Which core is doing this pop?
+                    cs << "        cb_pop_front(" << in_cb_name << ", 1);\n";
+                    num_input_cbs++;
+                }
+            } else {
+                // auto port = kernel->get_input_port(incoming_connections[incoming_connections.size() - i - 1].dest.port);
+                auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+                /**
+                * Copies a single tile from the specified input CB and writes the result to
+                * DST at a specified index. The function will employ unpacker to first unpack into SRC
+                * registers and then perform move into DST registers, at a specified index.
+                * For the in_tile_index to be valid for this call, cb_wait_front(n) had to be
+                * previously called to ensure that at least some number n>0 of tiles are available
+                * in the input CB. The CB index 0 then references the first tile in the received section of the CB,
+                * up to index n-1 (in a FIFO order). The DST register buffer must be in acquired state via
+                * acquire_dst call. This call is blocking and is only available on the compute
+                * engine.
+                *
+                * Return value: None
+                *
+                * | Argument       | Description                                       | Data type | Valid range                                         | required |
+                * |----------------|---------------------------------------------------|-----------|-----------------------------------------------------|----------|
+                * | in_cb_id       | The identifier of the source circular buffer (CB) | uint32_t  | 0 to 31                                             | Yes      |
+                * | in_tile_index  | The index of the tile to copy from the input CB   | uint32_t  | Must be less than the size of the CB                | Yes      |
+                * | dst_tile_index | The index of the tile in the DST register         | uint32_t  | Must be less than the size of the DST register (16) | Yes      |
+                * */
+                // cs << "        copy_tile(" << port.name << ", 0, " << incoming_connections.size() - i - 1 << ");\n";
+                cs << "        copy_tile(" << port.name << ", 0, " << num_input_cbs << ");\n";
+                // cs << "        UNPACK(( llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(" << port.name << ", 0)  ));\n";
+                // TODO: Not sure how this works in the context of the compute cores. Which core is doing this pop?
+                cs << "        cb_pop_front(" << port.name << ", 1);\n";
+                num_input_cbs++;
+            }
         }
     }
 
