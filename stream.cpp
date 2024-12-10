@@ -25,6 +25,50 @@ inline int get_tt_npu_clock(tt::tt_metal::Device *device) {
     return tt::Cluster::instance().get_device_aiclk(device->id());
 }
 
+
+
+GatherStream::GatherStream(const std::vector<uint32_t>& data_buffer, 
+                 tt::DataFormat data_format,
+                 uint32_t n_elements_,
+                 const std::vector<uint32_t>& index_data,
+                 bool use_sram)
+                 : Stream(index_data, index_data.size(), tt::DataFormat::UInt32), data_format(data_format), use_sram(use_sram) {
+    this->data_n_elements = n_elements_;
+    if (use_sram) {
+        std::cout << "Using SRAM for the GatherStream!\n";
+        // If we are placing the entire data buffer in the L1, padding is not needed.
+        this->data_buffer = data_buffer;
+    } else {
+        if (data_format == tt::DataFormat::Float16_b) {
+            // Accesses need to be at 32 byte boundaries, so we must pad our data every 16 b16 elements.
+            std::vector<bfloat16> in(data_n_elements * 16, bfloat16(0.0F));
+            std::vector<bfloat16> initial_data = unpack_uint32_vec_into_bfloat16_vec(data_buffer);
+            std::cout << "Initial data size: " << initial_data.size() << "\n";
+            for (size_t i = 0; i < in.size(); i++) {
+                in[i] = initial_data[i / 16];
+            }
+            this->data_buffer = pack_bfloat16_vec_into_uint32_vec(in);
+            std::cout << "Scaled data buffer: " << this->data_buffer.size() << "\n";
+        } else {
+            assert(false && "Unsupported data type for gather stream!\n");
+        }
+        // auto factor = 32 / datum_size(data_format);
+        // this->data_buffer.resize(data_buffer.size() * 8); // Every data element needs to be 32-byte aligned (8 u32s).
+        // for (size_t i = 0; i < this->data_buffer.size(); i++) {
+        //     // size_t idx = static_cast<uint32_t>(i) & ~7U; // Clears 3 LSBs, rounding down to nearest multiple of 8.
+        //     size_t idx = static_cast<uint32_t>(i / 8U);
+        //     this->data_buffer[i] = data_buffer[idx];
+        // }
+        // auto foo = unpack_uint32_vec_into_bfloat16_vec(this->data_buffer);
+        // for (size_t i = 0; i < foo.size(); i++) {
+        //   std::cout << i << ": " << foo[i].to_float() << "\n";
+        // }
+        // this->data_n_tiles = static_cast<uint32_t>(std::ceil(this->data_n_elements / static_cast<double>(TILE_SIZE)));
+        // std::cout << "Gather data n_elements: " << this->data_n_elements << "\n";
+        // std::cout << "Gather data n_tiles: " << this->data_n_tiles << "\n";
+    }
+}
+
 Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t max_parallelization_factor, uint32_t tiles_per_cb) 
     : kernels(std::move(kernels)), streams(streams), max_parallelization_factor(max_parallelization_factor), tiles_per_cb(tiles_per_cb) {
     // Check that all streams have the same number of elements.
@@ -126,24 +170,39 @@ void Map::execute() {
         if (stream->is_gather_stream()) {
             // Set up data buffer as well.
             auto *gather_stream = dynamic_cast<GatherStream*>(stream);
-            // Note: assuming underlying data is already 32 byte aligned and accesses are padded.
-            // auto total_size_bytes = gather_stream->n_elements * datum_size(gather_stream->data_format) * 32;
-            auto total_size_bytes = gather_stream->data_buffer.size() * 4;
-            std::cout << "data gather stream page size & total size: " << total_size_bytes << "\n";
-            tt_metal::InterleavedBufferConfig data_config = {
-                .device = runtime->device,
-                .size = total_size_bytes,
-                .page_size = total_size_bytes, // TODO: Random access doesn't work across pages, so we have page_size=total_size. Is this a problem?
-                .buffer_type = tt_metal::BufferType::DRAM,
-            };
-            gather_stream->data_buffer_device = tt_metal::CreateBuffer(data_config);
-            std::cout << "Created gather stream!\n";
-            tt_metal::EnqueueWriteBuffer(runtime->device->command_queue(),
-                                          gather_stream->data_buffer_device,
-                                          gather_stream->data_buffer, 
-                                          true);
-            gather_stream->data_buffer_address = gather_stream->data_buffer_device->address();
-            gather_stream->data_buffer_noc_coordinates = gather_stream->data_buffer_device->noc_coordinates();
+            if (!gather_stream->use_sram) {
+                // Note: assuming underlying data is already 32 byte aligned and accesses are padded.
+                auto total_size_bytes = gather_stream->data_buffer.size() * 4;
+                std::cout << "data gather stream page size & total size: " << total_size_bytes << "\n";
+                tt_metal::InterleavedBufferConfig data_config = {
+                    .device = runtime->device,
+                    .size = total_size_bytes,
+                    .page_size = total_size_bytes, // TODO: Random access doesn't work across pages, so we have page_size=total_size. Is this a problem?
+                    .buffer_type = tt_metal::BufferType::DRAM,
+                };
+                gather_stream->data_buffer_device = tt_metal::CreateBuffer(data_config);
+                std::cout << "Created gather stream!\n";
+                tt_metal::EnqueueWriteBuffer(runtime->device->command_queue(),
+                                            gather_stream->data_buffer_device,
+                                            gather_stream->data_buffer, 
+                                            true);
+                gather_stream->data_buffer_address = gather_stream->data_buffer_device->address();
+                gather_stream->data_buffer_noc_coordinates = gather_stream->data_buffer_device->noc_coordinates();
+            } else {
+                // We are placing the entire gather stream data buffer in L1.
+                auto total_size_bytes = gather_stream->data_buffer.size() * 4;
+                std::cout << "data gather stream page size & total size: " << total_size_bytes << "\n";
+                tt_metal::InterleavedBufferConfig data_config = {
+                    .device = runtime->device,
+                    .size = total_size_bytes,
+                    .page_size = total_size_bytes, // TODO: Random access doesn't work across pages, so we have page_size=total_size. Is this a problem?
+                    .buffer_type = tt_metal::BufferType::L1,
+                };
+                gather_stream->data_buffer_device = tt_metal::CreateBuffer(data_config);
+                std::cout << "Created gather stream!\n";
+                gather_stream->data_buffer_address = gather_stream->data_buffer_device->address();
+                gather_stream->data_buffer_noc_coordinates = gather_stream->data_buffer_device->noc_coordinates();
+            }
         }
     }
 
@@ -217,6 +276,12 @@ void Map::execute() {
                 
                 if (incoming_connections[k].source.is_stream()) {
                     if (streams[incoming_connections[k].source.index]->is_gather_stream()) {
+                        auto *stream = dynamic_cast<GatherStream*>(streams[incoming_connections[k].source.index]);
+                        // Init L1 data buffer.
+                        if (stream->use_sram) {
+                            tt::tt_metal::detail::WriteToDeviceL1(runtime->device, core, stream->data_buffer_device->address(), stream->data_buffer);
+                        }
+
                         // Setup intermed CB for gather stream indices.
                         auto intermed_cb_index = k + INTERMED_CB_START;
                         auto index_tile_size_bytes = TILE_SIZE * sizeof(uint32_t);
@@ -679,19 +744,35 @@ void Map::generate_reader_device_kernel(
             if (!stream->is_gather_stream()) {
                 continue;
             }
-            do_read_barrier = true;
             auto *gather_stream = dynamic_cast<GatherStream*>(stream);
-            auto port = kernel->get_input_port(connection.dest.port);
-            rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
-            rs << "            uint32_t " << port.name << "_write_ptr = get_write_ptr(" << port.name << ");\n";
-            rs << "            for (int i = 0; i < " << TILE_SIZE << "; i++) {\n";
-            rs << "                 uint32_t index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + i) * 32;\n";
-            // rs << "                 DPRINT << \"[READER 0] index: \" << index << ENDL();\n";
-            rs << "                 uint32_t " << port.name << "_offset = i * " << datum_size(gather_stream->data_format) << ";\n";
-            rs << "                 noc_async_read(" << port.name << "_data_dram_noc_addr + index, " << port.name << "_write_ptr + " << port.name << "_offset, " << datum_size(gather_stream->data_format) << ");\n";
-            // rs << "                 DPRINT << \"[READER 0] data: \" << float(*(((uint16_t *)" << port.name << "_write_ptr) + i)) << ENDL();\n";
-            rs << "            }\n";
-            rs << "        }\n";
+            if (!gather_stream->use_sram) {
+                do_read_barrier = true;
+                auto port = kernel->get_input_port(connection.dest.port);
+                rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
+                rs << "            uint32_t " << port.name << "_write_ptr = get_write_ptr(" << port.name << ");\n";
+                rs << "            for (int i = 0; i < " << TILE_SIZE << "; i++) {\n";
+                rs << "                 uint32_t index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + i) * 32;\n";
+                // rs << "                 DPRINT << \"[READER 0] index: \" << index << ENDL();\n";
+                rs << "                 uint32_t " << port.name << "_offset = i * " << datum_size(gather_stream->data_format) << ";\n";
+                rs << "                 noc_async_read(" << port.name << "_data_dram_noc_addr + index, " << port.name << "_write_ptr + " << port.name << "_offset, " << datum_size(gather_stream->data_format) << ");\n";
+                // rs << "                 DPRINT << \"[READER 0] data: \" << float(*(((uint16_t *)" << port.name << "_write_ptr) + i)) << ENDL();\n";
+                rs << "            }\n";
+                rs << "        }\n";
+            } else {
+                auto port = kernel->get_input_port(connection.dest.port);
+                rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
+                rs << "            uint16_t *" << port.name << "_write_ptr = (uint16_t *)get_write_ptr(" << port.name << ");\n";
+                rs << "            uint16_t *" << port.name << "_sram_ptr = (uint16_t *)" << port.name << "_data_addr;\n";
+                rs << "            for (int i = 0; i < " << TILE_SIZE << "; i++) {\n";
+                rs << "                 uint32_t index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + i);\n";
+                // rs << "                 DPRINT << \"[READER 0] index: \" << index << ENDL();\n";
+                // rs << "                 uint32_t " << port.name << "_offset = i * " << datum_size(gather_stream->data_format) << ";\n";
+                rs << "                 " << port.name << "_write_ptr[i] = " << port.name << "_sram_ptr[index];\n";
+                // rs << "                 noc_async_read(" << port.name << "_data_dram_noc_addr + index, " << port.name << "_write_ptr + " << port.name << "_offset, " << datum_size(gather_stream->data_format) << ");\n";
+                // rs << "                 DPRINT << \"[READER 0] data: \" << float(*(((uint16_t *)" << port.name << "_write_ptr) + i)) << ENDL();\n";
+                rs << "            }\n";
+                rs << "        }\n";
+            }
         }
 
         rs << "\n";
@@ -1308,6 +1389,7 @@ std::vector<uint32_t> Map::read_gather_stream(Stream *stream, bool read_data=tru
     assert(it != streams.end() && "Stream not found in map!");
     assert(stream->is_gather_stream() && "Must be gather stream!\n");
     auto *gather_stream = dynamic_cast<GatherStream*>(stream);
+    assert(!gather_stream->use_sram && "Cannot read from SRAM data buffer!\n");
     std::vector<uint32_t> out;
     if (read_data) {
         tt_metal::EnqueueReadBuffer(runtime->device->command_queue(), gather_stream->data_buffer_device, out, true);
