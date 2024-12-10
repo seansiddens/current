@@ -1521,7 +1521,7 @@ void Map::check_connections() {
             }
         }
 
-        // Check output ports
+        // Check output ports.
         for (const auto& output_port : kernel->output_ports) {
             bool found = false;
             for (const auto& conn : connections) {
