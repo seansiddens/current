@@ -25,14 +25,18 @@ inline int get_tt_npu_clock(tt::tt_metal::Device *device) {
     return tt::Cluster::instance().get_device_aiclk(device->id());
 }
 
+// GatherStream GatherStream::CreateStencil(const std::vector<uint32_t> &data, tt::DataFormat format, bool use_sram) {
+// }
 
 
 GatherStream::GatherStream(const std::vector<uint32_t>& data_buffer, 
                  tt::DataFormat data_format,
                  uint32_t n_elements_,
                  const std::vector<uint32_t>& index_data,
-                 bool use_sram)
-                 : Stream(index_data, index_data.size(), tt::DataFormat::UInt32), data_format(data_format), use_sram(use_sram) {
+                 bool use_sram,
+                 uint8_t accesses_per_token)
+                 : Stream(index_data, index_data.size(), tt::DataFormat::UInt32), data_format(data_format), use_sram(use_sram), accesses_per_token(accesses_per_token) {
+    assert(TILE_SIZE % accesses_per_token == 0 && "Accesses per token must evenly divide TILE SIZE! (1024)\n");
     this->data_n_elements = n_elements_;
     if (use_sram) {
         std::cout << "Using SRAM for the GatherStream!\n";
@@ -260,51 +264,60 @@ void Map::execute() {
             auto outgoing_connections = get_outgoing_connections(kernel);
 
             // Create circular buffers for each incoming and outgoing connection.
+            auto num_input_cbs = 0;
+            auto num_intermed_cbs = 0;
             for (size_t k = 0; k < incoming_connections.size(); k++) {
-                // Each port is typed with a specific data format. 
-                auto cb_index = k + IN_CB_START;
-                auto input_port = kernel->get_input_port(incoming_connections[k].dest.port);
-                auto input_port_index = kernel->get_input_port_index(input_port.name);
-                auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(input_port.data_format);
-                tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
-                    tiles_per_cb * tile_size_bytes,
-                    {{cb_index, input_port.data_format}}
-                ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
-                // TODO: Again, overwriting across multiple cores.
-                kernel->input_ports[input_port_index].cb = tt_metal::CreateCircularBuffer(runtime->program, core, cb_config);
-                std::cout << "Creating circular buffer at index " << cb_index << "!\n";
-                
-                if (incoming_connections[k].source.is_stream()) {
-                    if (streams[incoming_connections[k].source.index]->is_gather_stream()) {
-                        auto *stream = dynamic_cast<GatherStream*>(streams[incoming_connections[k].source.index]);
-                        // Init L1 data buffer.
-                        if (stream->use_sram) {
-                            tt::tt_metal::detail::WriteToDeviceL1(runtime->device, core, stream->data_buffer_device->address(), stream->data_buffer);
-                        }
-
-                        // Setup intermed CB for gather stream indices.
-                        auto intermed_cb_index = k + INTERMED_CB_START;
-                        auto index_tile_size_bytes = TILE_SIZE * sizeof(uint32_t);
-                        tt_metal::CircularBufferConfig index_cb_config = CircularBufferConfig(
-                            tiles_per_cb * index_tile_size_bytes,
-                            {{intermed_cb_index, tt::DataFormat::UInt32}}
-                        ).set_page_size(intermed_cb_index, index_tile_size_bytes); // TODO: Not sure what to set this page size to.
-                        // TODO: Does this handle even need to be stored anywhere?
-                        auto index_cb = tt_metal::CreateCircularBuffer(runtime->program, core, index_cb_config);
-                        std::cout << "Creating circular buffer at index " << intermed_cb_index << "!\n";
+                if (incoming_connections[k].source.is_stream() && streams[incoming_connections[k].source.index]->is_gather_stream()) {
+                    auto *stream = dynamic_cast<GatherStream*>(streams[incoming_connections[k].source.index]);
+                    // Init L1 data buffer.
+                    if (stream->use_sram) {
+                        tt::tt_metal::detail::WriteToDeviceL1(runtime->device, core, stream->data_buffer_device->address(), stream->data_buffer);
                     }
-                }
 
-                // // Create mailbox buffer for incoming connections from another kernel.
-                // if (incoming_connections[i].source.is_kernel()) {
-                //     auto mailbox_config = tt_metal::InterleavedBufferConfig{
-                //         .device = runtime.device,
-                //         .size = tile_size_bytes,
-                //         .page_size = tile_size_bytes,
-                //         .buffer_type = tt_metal::BufferType::L1
-                //     };
-                //     kernel->input_ports[input_port_index].mailbox = tt_metal::CreateBuffer(mailbox_config);
-                // }
+                    // Setup intermed CB for gather stream indices.
+                    auto intermed_cb_index = num_intermed_cbs + INTERMED_CB_START;
+                    num_intermed_cbs++;
+                    auto index_tile_size_bytes = TILE_SIZE * sizeof(uint32_t) * stream->accesses_per_token;
+                    tt_metal::CircularBufferConfig index_cb_config = CircularBufferConfig(
+                        tiles_per_cb * index_tile_size_bytes,
+                        {{intermed_cb_index, tt::DataFormat::UInt32}}
+                    ).set_page_size(intermed_cb_index, index_tile_size_bytes); // TODO: Not sure what to set this page size to.
+                    // TODO: Does this handle even need to be stored anywhere?
+                    auto index_cb = tt_metal::CreateCircularBuffer(runtime->program, core, index_cb_config);
+                    std::cout << "Creating circular buffer at index " << intermed_cb_index << "!\n";
+
+                    // Setup input CBs for streaming to compute.
+                    // For gather stream we have one input CB for every access per token.
+                    for (size_t access = 0; access < stream->accesses_per_token; access++) {
+                        // Each port is typed with a specific data format. 
+                        auto cb_index = num_input_cbs + IN_CB_START;
+                        num_input_cbs++;
+                        auto input_port = kernel->get_input_port(incoming_connections[k].dest.port);
+                        auto input_port_index = kernel->get_input_port_index(input_port.name);
+                        auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(input_port.data_format);
+                        tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
+                            tiles_per_cb * tile_size_bytes,
+                            {{cb_index, input_port.data_format}}
+                        ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
+                        // TODO: Again, overwriting across multiple cores.
+                        kernel->input_ports[input_port_index].cb = tt_metal::CreateCircularBuffer(runtime->program, core, cb_config);
+                        std::cout << "Creating circular buffer at index " << cb_index << "!\n";
+                    }
+                } else {
+                    // Each port is typed with a specific data format. 
+                    auto cb_index = num_input_cbs + IN_CB_START;
+                    num_input_cbs++;
+                    auto input_port = kernel->get_input_port(incoming_connections[k].dest.port);
+                    auto input_port_index = kernel->get_input_port_index(input_port.name);
+                    auto tile_size_bytes = TILE_WIDTH * TILE_HEIGHT * tt::datum_size(input_port.data_format);
+                    tt_metal::CircularBufferConfig cb_config = CircularBufferConfig(
+                        tiles_per_cb * tile_size_bytes,
+                        {{cb_index, input_port.data_format}}
+                    ).set_page_size(cb_index, tile_size_bytes); // TODO: Not sure what to set this page size to.
+                    // TODO: Again, overwriting across multiple cores.
+                    kernel->input_ports[input_port_index].cb = tt_metal::CreateCircularBuffer(runtime->program, core, cb_config);
+                    std::cout << "Creating circular buffer at index " << cb_index << "!\n";
+                }
             }
 
             for (size_t k = 0; k < outgoing_connections.size(); k++) {
@@ -391,9 +404,11 @@ void Map::execute() {
                         compute_args.push_back(n_tiles); // Compute also needs to know how many tiles to read in.
                     } else {
                         auto *gather_stream = dynamic_cast<GatherStream*>(stream);
+                        n_tiles *= gather_stream->accesses_per_token; // TODO: I HAVE NO IDEA IF THIS SHIT WORKS LMAO
+                        std::cout << "Gather stream index n_tiles: " << n_tiles << "\n";
                         // n_tiles = gather_stream->data_n_tiles / parallelization_factor;
                         // # of index tiles.
-                        reader_args.push_back(n_tiles); // TODO: Not accounting for parallelization.
+                        reader_args.push_back(n_tiles); 
                         // Address of index buffer.
                         reader_args.push_back(gather_stream->device_buffer_address); 
                         reader_args.push_back(tile_offset);
@@ -402,7 +417,7 @@ void Map::execute() {
                         // Data buffer noc coordinates.
                         reader_args.push_back(gather_stream->data_buffer_noc_coordinates.x);
                         reader_args.push_back(gather_stream->data_buffer_noc_coordinates.y);
-                        compute_args.push_back(n_tiles); // TODO: Not accounting for paralleization.
+                        compute_args.push_back(n_tiles); 
                     }
                 } else {
                     // Incoming connection is another kernel. 
@@ -638,23 +653,29 @@ void Map::generate_reader_device_kernel(
     uint32_t num_input_cbs = IN_CB_START;
     for (size_t i = 0; i < incoming_connections.size(); i++) {
         auto connection = incoming_connections[i];
-        // Assign CBs to input ports in iteration order.
         auto port = kernel->get_input_port(connection.dest.port);
-        rs << "    constexpr uint32_t " << port.name << " = " << num_input_cbs << ";\n";
-        rs << "    DPRINT << \"READER0: " << port.name << " tile_size: \" << get_tile_size(" << port.name << ") << ENDL();\n";
-
-        if (connection.source.is_stream()) {
-            auto *stream = streams[connection.source.index];
-            if (stream->is_gather_stream()) {
-                // Incoming gather streams need two CBs. The data will be put in an "input" CB, while the indices will be staged in an intermed CB.
-                rs << "    constexpr uint32_t " << port.name << "_indices = " << INTERMED_CB_START + num_input_cbs << ";\n";
-                rs << "    DPRINT << \"READER0: " << port.name << "_indices tile_size: \" << get_tile_size(" << port.name << "_indices" << ") << ENDL();\n";
-                // The intermed CB is solely used as a staging buffer for the indices, so we can fetch the write_ptr at the start.
-                rs << "    uint32_t " << port.name << "_indices_write_ptr = get_write_ptr(" << port.name << "_indices);\n";
+        if (connection.source.is_stream() && streams[connection.source.index]->is_gather_stream()) {
+            // Input is a gather stream, generate input CB for each access per token.
+            // Generate one intermed CB.
+            auto *stream = dynamic_cast<GatherStream*>(streams[connection.source.index]);
+            // The data will be put in an "input" CB, while the indices will be staged in an intermed CB.
+            rs << "    constexpr uint32_t " << port.name << "_indices = " << INTERMED_CB_START + num_input_cbs << ";\n";
+            rs << "    DPRINT << \"READER0: " << port.name << "_indices tile_size: \" << get_tile_size(" << port.name << "_indices" << ") << ENDL();\n";
+            // The intermed CB is solely used as a staging buffer for the indices, so we can fetch the write_ptr at the start.
+            rs << "    uint32_t " << port.name << "_indices_write_ptr = get_write_ptr(" << port.name << "_indices);\n";
+            for (size_t access = 0; access < stream->accesses_per_token; access += 1) {
+                // Assign CBs to input ports in iteration order.
+                std::string in_cb_name = port.name + "_" + std::to_string(num_input_cbs);
+                rs << "    constexpr uint32_t " << in_cb_name << " = " << num_input_cbs << ";\n";
+                rs << "    DPRINT << \"READER0: " << in_cb_name << " tile_size: \" << get_tile_size(" <<  num_input_cbs << ") << ENDL();\n";
+                num_input_cbs++;
             }
+        } else {
+            // Assign CBs to input ports in iteration order.
+            rs << "    constexpr uint32_t " << port.name << " = " << num_input_cbs << ";\n";
+            rs << "    DPRINT << \"READER0: " << port.name << " tile_size: \" << get_tile_size(" << port.name << ") << ENDL();\n";
+            num_input_cbs++;
         }
-
-        num_input_cbs++;
     }
     rs << "\n";
 
@@ -687,16 +708,32 @@ void Map::generate_reader_device_kernel(
 
         // Wait for space in CBs
         bool do_read_barrier = false;
+        num_input_cbs = IN_CB_START;
         for (size_t i = 0; i < incoming_connections.size(); i++) {
             auto connection = incoming_connections[i];
             if (!connection.source.is_stream()) {
                 continue;
             }
+
             auto port = kernel->get_input_port(incoming_connections[i].dest.port);
-            rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
-            rs << "            cb_reserve_back(" << port.name << ", 1);\n";
-            rs << "        }\n";
-            do_read_barrier = true;
+            if (!streams[connection.source.index]->is_gather_stream()) {
+                rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
+                rs << "            cb_reserve_back(" << port.name << ", 1);\n";
+                rs << "        }\n";
+                do_read_barrier = true;
+                num_input_cbs++;
+            } else {
+                auto *stream = dynamic_cast<GatherStream *>(streams[connection.source.index]);
+                // For each gather stream, we wait on an input cb per access.
+                rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
+                for (size_t access = 0; access < stream->accesses_per_token; access++) {
+                    std::string in_cb_name = port.name + "_" + std::to_string(num_input_cbs);
+                    rs << "            cb_reserve_back(" << in_cb_name << ", 1);\n";
+                    do_read_barrier = true;
+                    num_input_cbs++;
+                }
+                rs << "        }\n";
+            }
         }
         // Read tile into CB from DRAM.
         for (size_t i = 0; i < incoming_connections.size(); i++) {
@@ -735,13 +772,16 @@ void Map::generate_reader_device_kernel(
         rs << "\n";
 
         // Process gather stream read requests from index CBs.
+        num_input_cbs = IN_CB_START;
         for (size_t i = 0; i < incoming_connections.size(); i++) {
             auto connection = incoming_connections[i];
             if (!connection.source.is_stream()) {
+                num_input_cbs++;
                 continue;
             }
             auto *stream = streams[connection.source.index];
             if (!stream->is_gather_stream()) {
+                num_input_cbs++;
                 continue;
             }
             auto *gather_stream = dynamic_cast<GatherStream*>(stream);
@@ -749,13 +789,49 @@ void Map::generate_reader_device_kernel(
                 do_read_barrier = true;
                 auto port = kernel->get_input_port(connection.dest.port);
                 rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
-                rs << "            uint32_t " << port.name << "_write_ptr = get_write_ptr(" << port.name << ");\n";
+                // auto tmp_n_in_cbs = num_input_cbs;
+                // for (size_t access = 0; access < gather_stream->accesses_per_token; access++) {
+                //     std::string in_cb_name = port.name + "_" + std::to_string(tmp_n_in_cbs);
+                //     rs << "            uint32_t " << in_cb_name << "_write_ptr = get_write_ptr(" << in_cb_name << ");\n";
+                //     tmp_n_in_cbs++;
+                // }
+                // rs << "            uint32_t index;\n";
+                // rs << "            for (int i = 0; i < " << TILE_SIZE << "; i++) {\n";
+                // for (size_t access = 0; access < gather_stream->accesses_per_token; access++) {
+                //     std::string in_cb_name = port.name + "_" + std::to_string(num_input_cbs);
+                //     rs << "                 index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + i + " << access << ") * 32;\n";
+                //     // rs << "                 DPRINT << \"[READER 0] index: \" << index << ENDL();\n";
+                //     rs << "                 uint32_t " << in_cb_name << "_offset = i * " << datum_size(gather_stream->data_format) << ";\n";
+                //     rs << "                 noc_async_read(" << port.name << "_data_dram_noc_addr + index, " << in_cb_name << "_write_ptr + " << in_cb_name << "_offset, " << datum_size(gather_stream->data_format) << ");\n";
+                //     // rs << "                 DPRINT << \"[READER 0] data: \" << float(*(((uint16_t *)" << port.name << "_write_ptr) + i)) << ENDL();\n";
+                //     num_input_cbs++;
+                // }
+                // rs << "            }\n";
+                // First generate write pointer declarations
+                auto tmp_n_in_cbs = num_input_cbs;
+                for (size_t access = 0; access < gather_stream->accesses_per_token; access++) {
+                    std::string in_cb_name = port.name + "_" + std::to_string(tmp_n_in_cbs);
+                    rs << "            uint32_t " << in_cb_name << "_write_ptr = get_write_ptr(" << in_cb_name << ");\n";
+                    tmp_n_in_cbs++;
+                }
+
+                rs << "            uint32_t index;\n";
                 rs << "            for (int i = 0; i < " << TILE_SIZE << "; i++) {\n";
-                rs << "                 uint32_t index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + i) * 32;\n";
-                // rs << "                 DPRINT << \"[READER 0] index: \" << index << ENDL();\n";
-                rs << "                 uint32_t " << port.name << "_offset = i * " << datum_size(gather_stream->data_format) << ";\n";
-                rs << "                 noc_async_read(" << port.name << "_data_dram_noc_addr + index, " << port.name << "_write_ptr + " << port.name << "_offset, " << datum_size(gather_stream->data_format) << ");\n";
-                // rs << "                 DPRINT << \"[READER 0] data: \" << float(*(((uint16_t *)" << port.name << "_write_ptr) + i)) << ENDL();\n";
+
+                // For each access, read from its interleaved position
+                for (size_t access = 0; access < gather_stream->accesses_per_token; access++) {
+                    std::string in_cb_name = port.name + "_" + std::to_string(num_input_cbs);
+                    
+                    // Calculate interleaved index position: i * accesses_per_token + access
+                    rs << "                index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + (i * " << std::to_string(gather_stream->accesses_per_token) << " + " << access << ")) * 32;\n";
+                    
+                    rs << "                uint32_t " << in_cb_name << "_offset = i * " << datum_size(gather_stream->data_format) << ";\n";
+                    rs << "                noc_async_read(" << port.name << "_data_dram_noc_addr + index, " 
+                    << in_cb_name << "_write_ptr + " << in_cb_name << "_offset, " 
+                    << datum_size(gather_stream->data_format) << ");\n";
+                    
+                    num_input_cbs++;
+                }
                 rs << "            }\n";
                 rs << "        }\n";
             } else {
@@ -772,6 +848,7 @@ void Map::generate_reader_device_kernel(
                 // rs << "                 DPRINT << \"[READER 0] data: \" << float(*(((uint16_t *)" << port.name << "_write_ptr) + i)) << ENDL();\n";
                 rs << "            }\n";
                 rs << "        }\n";
+                num_input_cbs++;
             }
         }
 
@@ -784,16 +861,32 @@ void Map::generate_reader_device_kernel(
 
         // Push tiles into CBs and increment counters.
         // Signals to compute engine that a tile is ready to be processed.
+        num_input_cbs = IN_CB_START;
         for (size_t i = 0; i < incoming_connections.size(); i++) {
             auto connection = incoming_connections[i];
             if (!connection.source.is_stream()) {
+                num_input_cbs++;
                 continue;
             }
-            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
-            rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
-            rs << "            cb_push_back(" << port.name << ", 1);\n";
-            rs << "            " << port.name << "_count++;\n";
-            rs << "        }\n";
+            if (!streams[connection.source.index]->is_gather_stream()) {
+                auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+                rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
+                rs << "            cb_push_back(" << port.name << ", 1);\n";
+                rs << "            " << port.name << "_count++;\n";
+                rs << "        }\n";
+                num_input_cbs++;
+            } else {
+                auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+                auto *stream = dynamic_cast<GatherStream*>(streams[connection.source.index]);
+                rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
+                for (size_t access = 0; access < stream->accesses_per_token; access++) {
+                    std::string in_cb_name = port.name + "_" + std::to_string(num_input_cbs);
+                    rs << "            cb_push_back(" << in_cb_name << ", 1);\n";
+                    num_input_cbs++;
+                }
+                rs << "            " << port.name << "_count++;\n";
+                rs << "        }\n";
+            }
         }
 
         // Do receiver stuff.
@@ -873,8 +966,19 @@ void Map::generate_compute_device_kernel(
         // Can probably avoid any call to the sfpi function, don't need to do sfpi init? idk
         cs << "    for (int i = 0; i < 32; i++) {\n";
         // Get input variables.
+        auto total_incoming = 0;
         for (size_t i = 0; i < incoming_connections.size(); i++) {
-            cs << "        vFloat in" << i << " = dst_reg[" << i << " * 32 + i];\n";
+            auto conn = incoming_connections[i];
+            if (conn.source.is_stream() && streams[conn.source.index]->is_gather_stream()) {
+                auto *stream = dynamic_cast<GatherStream*>(streams[conn.source.index]);
+                for (size_t access = 0; access < stream->accesses_per_token; access++) {
+                    cs << "        vFloat in" << std::to_string(total_incoming) << " = dst_reg[" << std::to_string(total_incoming) << " * 32 + i];\n";
+                    total_incoming++;
+                }
+            } else {
+                cs << "        vFloat in" << std::to_string(total_incoming) << " = dst_reg[" << std::to_string(total_incoming) << " * 32 + i];\n";
+                total_incoming++;
+            }
         }
         // Declare output variables.
         for (size_t i = 0; i < outgoing_connections.size(); i++) {
@@ -917,9 +1021,20 @@ void Map::generate_compute_device_kernel(
     uint32_t num_input_cbs = IN_CB_START;
     for (size_t i = 0; i < incoming_connections.size(); i++) {
         // Assign CBs to input ports in iteration order.
-        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
-        cs << "    constexpr uint32_t " << port.name << " = " << num_input_cbs << ";\n";
-        num_input_cbs++;
+        auto conn = incoming_connections[i];
+        if (conn.source.is_stream() && streams[conn.source.index]->is_gather_stream()) {
+            auto *stream = dynamic_cast<GatherStream*>(streams[conn.source.index]);
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            for (size_t access = 0; access < stream->accesses_per_token; access++) {
+                std::string in_cb_name = port.name + "_" + std::to_string(access);
+                cs << "    constexpr uint32_t " << in_cb_name << " = " << num_input_cbs << ";\n";
+                num_input_cbs++;
+            }
+        } else {
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            cs << "    constexpr uint32_t " << port.name << " = " << num_input_cbs << ";\n";
+            num_input_cbs++;
+        }
     }
     cs << "\n";
     uint32_t num_output_cbs = OUT_CB_START; // Output CBs start at index 16.
@@ -934,9 +1049,22 @@ void Map::generate_compute_device_kernel(
 
 
     // Initialize SFPU.
+    num_input_cbs = IN_CB_START;
     for (size_t i = 0; i < incoming_connections.size(); i++) {
-        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
-        cs << "    init_sfpu(" << port.name << ");\n";
+        auto conn = incoming_connections[i];
+        if (conn.source.is_stream() && streams[conn.source.index]->is_gather_stream()) {
+            auto *stream = dynamic_cast<GatherStream*>(streams[conn.source.index]);
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            for (size_t access = 0; access < stream->accesses_per_token; access++) {
+                std::string in_cb_name = port.name + "_" + std::to_string(access);
+                cs << "    init_sfpu(" << in_cb_name << ");\n";
+                num_input_cbs++;
+            }
+        } else {
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            cs << "    init_sfpu(" << port.name << ");\n";
+            num_input_cbs++;
+        }
     }
     if (kernel->do_matmul) {
         // TODO: This assumes that we are matmuling port 0 and 1.
@@ -948,11 +1076,24 @@ void Map::generate_compute_device_kernel(
 
     // Tile stream loop
     // TODO: Right now just going to assume that all streams have the same number of tiles.
-    cs << "    for(uint32_t i = 0; i < n_tiles; i++) {\n";
+    cs << "    for (uint32_t i = 0; i < n_tiles; i++) {\n";
     // Wait for tiles to be read in CBs.
+    num_input_cbs = IN_CB_START;
     for (size_t i = 0; i < incoming_connections.size(); i++) {
-        auto port = kernel->get_input_port(incoming_connections[i].dest.port);
-        cs << "        cb_wait_front(" << port.name << ", 1);\n";
+        auto conn = incoming_connections[i];
+        if (conn.source.is_stream() && streams[conn.source.index]->is_gather_stream()) {
+            auto *stream = dynamic_cast<GatherStream*>(streams[conn.source.index]);
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            for (size_t access = 0; access < stream->accesses_per_token; access++) {
+                std::string in_cb_name = port.name + "_" + std::to_string(access);
+                cs << "        cb_wait_front(" << in_cb_name << ", 1);\n";
+                num_input_cbs++;
+            }
+        } else {
+            auto port = kernel->get_input_port(incoming_connections[i].dest.port);
+            cs << "        cb_wait_front(" << port.name << ", 1);\n";
+            num_input_cbs++;
+        }
     }
     cs << "\n";
 
@@ -1428,14 +1569,35 @@ void Map::propagate_counts() {
         connection.n_tiles = 0;
     }
 
+    // // First pass: Set counts from source streams
+    // for (size_t i = 0; i < connections.size(); i++) {
+    //     auto& connection = connections[i];
+    //     if (connection.source.is_stream()) {
+    //         auto stream = streams[connection.source.index];
+    //         connection.n_tiles = stream->n_tiles;
+    //     }
+    // }
+
     // First pass: Set counts from source streams
     for (size_t i = 0; i < connections.size(); i++) {
         auto& connection = connections[i];
         if (connection.source.is_stream()) {
-            auto stream = streams[connection.source.index];
-            connection.n_tiles = stream->n_tiles;
+            auto *stream = streams[connection.source.index];
+            if (stream->is_gather_stream()) {
+                auto *gather_stream = dynamic_cast<GatherStream*>(stream);
+                // For gather streams, divide by accesses_per_token
+                if (stream->n_tiles % gather_stream->accesses_per_token != 0) {
+                    tt::log_error("GatherStream {} has n_tiles {} not evenly divisible by accesses_per_token {}",
+                        connection.source.index, stream->n_tiles, gather_stream->accesses_per_token);
+                }
+                connection.n_tiles = stream->n_tiles / gather_stream->accesses_per_token;
+            } else {
+                // For normal streams, just use n_tiles directly
+                connection.n_tiles = stream->n_tiles;
+            }
         }
     }
+
 
     // Keep propagating until no changes are made
     bool changed = true;
@@ -1482,6 +1644,13 @@ void Map::propagate_counts() {
                 connection.source.index,
                 connection.dest.endpoint_type == Endpoint::EndpointType::Kernel ? "kernel" : "stream",
                 connection.dest.index);
+        } else {
+            tt::log_info("[CURRENT] Connection from {} {} to {} {} has tile count of : {}!",
+                connection.source.endpoint_type == Endpoint::EndpointType::Kernel ? "kernel" : "stream",
+                connection.source.index,
+                connection.dest.endpoint_type == Endpoint::EndpointType::Kernel ? "kernel" : "stream",
+                connection.dest.index,
+                connection.n_tiles);
         }
     }
 }

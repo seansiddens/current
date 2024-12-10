@@ -56,15 +56,19 @@ class Stream {
 
     friend class Map;
 };
-
 class GatherStream : public Stream {
   public: 
     GatherStream(const std::vector<uint32_t>& data_buffer, 
                  tt::DataFormat data_format,
                  uint32_t n_elements_,
                  const std::vector<uint32_t>& index_data,
-                 bool use_sram=false);
+                 bool use_sram=false,
+                 uint8_t accesses_per_token=1);
     [[nodiscard]] bool is_gather_stream() const override { return true; }
+
+    static GatherStream CreateStencil(const std::vector<uint32_t>& data,
+                                      tt::DataFormat format,
+                                      bool use_sram = false);
 
 
   private:
@@ -75,6 +79,7 @@ class GatherStream : public Stream {
     tt::DataFormat data_format;
     uint32_t data_n_elements;
     uint32_t data_n_tiles;
+    uint8_t accesses_per_token;
     bool use_sram;
 
     friend class Map;
@@ -90,6 +95,7 @@ class Map {
     void execute();
     void generate_device_kernels();
     void check_connections();
+    void propagate_counts();
     std::vector<uint32_t> read_stream(Stream *stream);
     std::vector<uint32_t> read_gather_stream(Stream *stream, bool read_data);
     void parallelize(std::vector<CoreCoord> &cores);
@@ -165,7 +171,6 @@ class Map {
     void generate_compute_device_kernel(Kernel *kernel, std::vector<Connection> incoming_connections, std::vector<Connection> outgoing_connections);
     void generate_writer_device_kernel(Kernel *kernel, std::vector<Connection> outgoing_connections);
     bool has_incoming_connection(Kernel *kernel);
-    void propagate_counts();
 };
 
 } // End namespace current.
