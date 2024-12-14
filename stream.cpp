@@ -660,6 +660,7 @@ void Map::generate_reader_device_kernel(
             // total_args++;
 
             rs << "    volatile tt_l1_ptr uint32_t* " << port.name << "_receiver_semaphore_addr_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(" << port.name << "_receiver_semaphore_addr);\n";
+            rs << "    volatile tt_l1_ptr uint32_t* " << port.name << "_sender_semaphore_addr_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(" << port.name << "_sender_semaphore_addr);\n";
             rs << "    uint64_t " << port.name << "_sender_semaphore_noc_addr = get_noc_addr(" << port.name << "_sender_noc_x, " << port.name << "_sender_noc_y, " << port.name << "_sender_semaphore_addr);\n";
             rs << "    DPRINT << \"READER1: " << port.name << "_sender_semaphore_noc_addr: \" << " << port.name << "_sender_semaphore_noc_addr << ENDL();\n";
             rs << "\n";
@@ -920,7 +921,10 @@ void Map::generate_reader_device_kernel(
             rs << "        noc_semaphore_set(" << port.name << "_receiver_semaphore_addr_ptr, INVALID);\n";
             // Tell sender we're ready -- atomic increment sender's semaphore.
             rs << "        DPRINT << \"READER1: Telling sender we're ready\" << ENDL();\n";
-            rs << "        noc_semaphore_inc(" << port.name << "_sender_semaphore_noc_addr, 1);\n";
+            // rs << "        noc_semaphore_inc(" << port.name << "_sender_semaphore_noc_addr, 1);\n";
+            rs << "        *(" << port.name << "_sender_semaphore_addr_ptr) = get_write_ptr(" << port.name << ");\n";
+            // rs << "        DPRINT << \"READER1: in cb ptr: << \" *(" << port.name << "_sender_semaphore_addr_ptr) << ENDL();\n";
+            rs << "        noc_semaphore_set_remote(" << port.name << "_sender_semaphore_addr, " << port.name << "_sender_semaphore_noc_addr);\n";
             // Wait on receiver's own semaphore value to become VALID (set by sender after it sends the data).
             rs << "        DPRINT << \"READER1: Waiting on receiver's semaphore\" << ENDL();\n";
             rs << "        noc_semaphore_wait(" << port.name << "_receiver_semaphore_addr_ptr, VALID);\n";
@@ -1390,7 +1394,7 @@ void Map::generate_writer_device_kernel(
         auto receiver_port = kernel->get_input_port(outgoing_connections[i].dest.port);
         // Wait until receiver has set the sender's semaphore to 1, which means receiver has reserved space in their CB.
         ws << "        DPRINT << \"WRITER0: Waiting for sender's semaphore to be set to 1\" << ENDL();\n";
-        ws << "        noc_semaphore_wait(" << sender_port.name << "_sender_semaphore_addr_ptr, 1);\n";
+        ws << "        noc_semaphore_wait_min(" << sender_port.name << "_sender_semaphore_addr_ptr, 1);\n";
 
         // Wait for data to be ready to be sent.
         ws << "        DPRINT << \"WRITER0: Waiting for data to be ready to be sent from CB\" << ENDL();\n";
@@ -1402,7 +1406,8 @@ void Map::generate_writer_device_kernel(
         // TODO: Need to figure out how to do this. RN I'm just going to assume the receiver is using in0 CB.
         // This might assume that the CBs are set up in the same exact way on both tiles?
         ws << "        uint32_t " << sender_port.name << "_receiver_read_ptr = get_read_ptr(0);\n";
-        ws << "        uint64_t " << sender_port.name << "_receiver_noc_addr = get_noc_addr(" << sender_port.name << "_receiver_noc_x, " << sender_port.name << "_receiver_noc_y, " << sender_port.name << "_receiver_read_ptr);\n";
+        // ws << "        uint64_t " << sender_port.name << "_receiver_noc_addr = get_noc_addr(" << sender_port.name << "_receiver_noc_x, " << sender_port.name << "_receiver_noc_y, " << sender_port.name << "_receiver_read_ptr);\n";
+        ws << "        uint64_t " << sender_port.name << "_receiver_noc_addr = get_noc_addr(" << sender_port.name << "_receiver_noc_x, " << sender_port.name << "_receiver_noc_y, *(" << sender_port.name << "_sender_semaphore_addr_ptr));\n";
         ws << "        DPRINT << \"WRITER0: " << sender_port.name << "_receiver_noc_addr: \" << " << sender_port.name << "_receiver_noc_addr << ENDL();\n";
         // TODO: Don't hardcode the tile size, use elment size of stream data.
         ws << "        noc_async_write(" << sender_port.name << "_read_ptr, " << sender_port.name << "_receiver_noc_addr, " << TILE_WIDTH * TILE_HEIGHT * 2 << ");\n";
