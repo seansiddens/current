@@ -79,7 +79,7 @@ Map::Map(std::vector<Kernel *> kernels, std::vector<Stream *> streams, uint32_t 
     for (size_t i = 1; i < streams.size(); i++) {
         // TODO: Eventually we want to support streams of different sizes e.g for reduction kernels,
         // but right now we just check that all streams have the same number of elements.
-        assert(streams[i]->n_elements == streams[0]->n_elements && "All streams must have the same number of elements!");
+        // assert(streams[i]->n_elements == streams[0]->n_elements && "All streams must have the same number of elements!");
     }
 }
 
@@ -855,18 +855,29 @@ void Map::generate_reader_device_kernel(
             } else {
                 auto port = kernel->get_input_port(connection.dest.port);
                 rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
-                rs << "            uint16_t *" << port.name << "_write_ptr = (uint16_t *)get_write_ptr(" << port.name << ");\n";
+                auto tmp_n_in_cbs = num_input_cbs;
+                for (size_t access = 0; access < gather_stream->accesses_per_token; access++) {
+                    std::string in_cb_name = port.name + "_" + std::to_string(tmp_n_in_cbs);
+                    rs << "            uint16_t *" << in_cb_name << "_write_ptr = (uint16_t *)get_write_ptr(" << in_cb_name << ");\n";
+                    tmp_n_in_cbs++;
+                }
                 rs << "            uint16_t *" << port.name << "_sram_ptr = (uint16_t *)" << port.name << "_data_addr;\n";
+                rs << "            uint32_t index;\n";
                 rs << "            for (int i = 0; i < " << TILE_SIZE << "; i++) {\n";
-                rs << "                 uint32_t index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + i);\n";
-                // rs << "                 DPRINT << \"[READER 0] index: \" << index << ENDL();\n";
-                // rs << "                 uint32_t " << port.name << "_offset = i * " << datum_size(gather_stream->data_format) << ";\n";
-                rs << "                 " << port.name << "_write_ptr[i] = " << port.name << "_sram_ptr[index];\n";
-                // rs << "                 noc_async_read(" << port.name << "_data_dram_noc_addr + index, " << port.name << "_write_ptr + " << port.name << "_offset, " << datum_size(gather_stream->data_format) << ");\n";
-                // rs << "                 DPRINT << \"[READER 0] data: \" << float(*(((uint16_t *)" << port.name << "_write_ptr) + i)) << ENDL();\n";
+
+                // For each access.
+                for (size_t access = 0; access < gather_stream->accesses_per_token; access++) {
+                    std::string in_cb_name = port.name + "_" + std::to_string(num_input_cbs);
+                    rs << "                 index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + i);\n";
+                    // rs << "                 DPRINT << \"[READER 0] index: \" << index << ENDL();\n";
+                    // rs << "                 uint32_t " << port.name << "_offset = i * " << datum_size(gather_stream->data_format) << ";\n";
+                    rs << "                 " << in_cb_name << "_write_ptr[i] = " << port.name << "_sram_ptr[index];\n";
+                    // rs << "                 noc_async_read(" << port.name << "_data_dram_noc_addr + index, " << port.name << "_write_ptr + " << port.name << "_offset, " << datum_size(gather_stream->data_format) << ");\n";
+                    // rs << "                 DPRINT << \"[READER 0] data: \" << float(*(((uint16_t *)" << port.name << "_write_ptr) + i)) << ENDL();\n";
+                    num_input_cbs++;
+                }
                 rs << "            }\n";
                 rs << "        }\n";
-                num_input_cbs++;
             }
         }
 
