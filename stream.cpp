@@ -868,7 +868,9 @@ void Map::generate_reader_device_kernel(
                 // For each access.
                 for (size_t access = 0; access < gather_stream->accesses_per_token; access++) {
                     std::string in_cb_name = port.name + "_" + std::to_string(num_input_cbs);
-                    rs << "                 index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + i);\n";
+                    // Calculate interleaved index position: i * accesses_per_token + access
+                    rs << "                index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + (i * " << std::to_string(gather_stream->accesses_per_token) << " + " << access << "));\n";
+                    // rs << "                 index = *(((uint32_t *)" << port.name << "_indices_write_ptr) + i);\n";
                     // rs << "                 DPRINT << \"[READER 0] index: \" << index << ENDL();\n";
                     // rs << "                 uint32_t " << port.name << "_offset = i * " << datum_size(gather_stream->data_format) << ";\n";
                     rs << "                 " << in_cb_name << "_write_ptr[i] = " << port.name << "_sram_ptr[index];\n";
