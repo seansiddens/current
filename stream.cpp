@@ -163,7 +163,8 @@ void Map::execute() {
             tt_metal::InterleavedBufferConfig config = {
                 .device = runtime->device,
                 .size = gather_stream->n_elements * gather_stream->element_size,
-                .page_size = stream->element_size * TILE_WIDTH * TILE_HEIGHT * gather_stream->accesses_per_token, // We fetch n indices for every n accesses, so index tile has to be n times larger.
+                // .page_size = stream->element_size * TILE_WIDTH * TILE_HEIGHT * gather_stream->accesses_per_token, // We fetch n indices for every n accesses, so index tile has to be n times larger.
+                .page_size = gather_stream->n_elements * gather_stream->element_size, // TODO: What should this be?
                 .buffer_type = tt_metal::BufferType::DRAM
             };
             std::cout << "STREAM " << i << ": size: " << config.size << std::endl;
@@ -429,6 +430,8 @@ void Map::execute() {
                         // Address of index buffer.
                         reader_args.push_back(gather_stream->device_buffer_address); 
                         reader_args.push_back(tile_offset);
+                        reader_args.push_back(gather_stream->device_buffer_noc_coordinates.x);
+                        reader_args.push_back(gather_stream->device_buffer_noc_coordinates.y);
                         // Address of data buffer.
                         reader_args.push_back(gather_stream->data_buffer_address); 
                         // Data buffer noc coordinates.
@@ -601,13 +604,19 @@ void Map::generate_reader_device_kernel(
                 rs << "    uint32_t " << port.name << "_tile_offset = get_arg_val<uint32_t>(" << total_args << ");\n";
                 rs << "    DPRINT << \"READER0: " << port.name << "_tile_offset: \" << " << port.name << "_tile_offset << ENDL();\n";
                 total_args++;
+                rs << "    uint32_t " << port.name << "_noc_x = get_arg_val<uint32_t>(" << total_args << ");\n";
+                total_args++;
+                rs << "    uint32_t " << port.name << "_noc_y = get_arg_val<uint32_t>(" << total_args << ");\n";
+                total_args++;
+                rs << "    uint64_t " << port.name << "_noc_addr = get_noc_addr(" << port.name << "_noc_x, " << port.name << "_noc_y, " << port.name << "_addr);\n";
+                rs << "\n";
                 // Address generator.
                 // TODO: Do we need this? How does this even work?
-                rs << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
-                rs << "        .bank_base_address = " << port.name << "_addr, \n";
-                rs << "        .page_size = " << std::to_string(TILE_WIDTH * TILE_HEIGHT * gather_stream->element_size * gather_stream->accesses_per_token) << ", \n";
-                rs << "        .data_format = " << data_format_to_string(gather_stream->format) << ", \n";
-                rs << "    };\n\n";
+                // rs << "    const InterleavedAddrGenFast<true> " << port.name << "_addr_gen = {\n";
+                // rs << "        .bank_base_address = " << port.name << "_addr, \n";
+                // rs << "        .page_size = " << std::to_string(TILE_WIDTH * TILE_HEIGHT * gather_stream->element_size * gather_stream->accesses_per_token) << ", \n";
+                // rs << "        .data_format = " << data_format_to_string(gather_stream->format) << ", \n";
+                // rs << "    };\n\n";
 
                 // Args for data buffer of gather stream. This doesn't use an address generator since we are doing non-contiguous reads.
                 rs << "    uint32_t " << port.name << "_data_addr = get_arg_val<uint32_t>(" << total_args << ");\n";
@@ -775,7 +784,9 @@ void Map::generate_reader_device_kernel(
                 rs << "        if (" << port.name << "_count < " << port.name << "_ntiles) {\n";
                 rs << "            uint32_t id = "<< port.name << "_tile_offset + " << port.name << "_count;\n";
                 rs << "            DPRINT << \"READER0: id: \" << id << ENDL();\n";
-                rs << "            noc_async_read_tile(id, " <<  port.name << "_addr_gen, " << port.name << "_indices_write_ptr);\n";
+                // rs << "            noc_async_read_tile(id, " <<  port.name << "_addr_gen, " << port.name << "_indices_write_ptr);\n";
+                auto tile_size_bytes = TILE_SIZE * gather_stream->accesses_per_token * 4;
+                rs << "            noc_async_read(" << port.name << "_noc_addr + (id * " << tile_size_bytes << ")" << ", " << port.name << "_indices_write_ptr, " << tile_size_bytes << ");\n"; // TODO: Don't hardcode offset and size values.
                 rs << "        }\n";
             }
         }
