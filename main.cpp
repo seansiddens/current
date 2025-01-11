@@ -13,6 +13,7 @@
 
 #include "common.hpp"
 #include "stream.hpp"
+#include "map.hpp"
 
 using namespace tt;
 using namespace tt::tt_metal;
