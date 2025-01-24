@@ -38,6 +38,7 @@ class Stream {
     virtual ~Stream() = default;
 
     [[nodiscard]] virtual bool is_gather_stream() const { return false; }
+    [[nodiscard]] size_t size() const { return this->n_elements; }
 
   protected:
     // Corresponding host data for the buffer. 
@@ -64,6 +65,7 @@ class GatherStream : public Stream {
                  const std::vector<uint32_t>& index_data,
                  bool use_sram=false,
                  uint8_t accesses_per_token=1);
+
     [[nodiscard]] bool is_gather_stream() const override { return true; }
 
     static GatherStream CreateStencil(const std::vector<uint32_t>& data,

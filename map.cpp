@@ -1,6 +1,7 @@
 #include "map.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <sstream>
 #include <fstream>
@@ -65,7 +66,7 @@ void Map::add_connection(Kernel *src, std::string src_out, Stream *dst) {
 //     }
 // }
 
-void Map::execute() {
+std::chrono::steady_clock::duration Map::execute() {
     check_connections();
     propagate_counts();
 
@@ -154,10 +155,12 @@ void Map::execute() {
                 gather_stream->data_buffer_noc_coordinates = gather_stream->data_buffer_device->noc_coordinates();
             }
         } else {
+            auto page_size = stream->element_size * TILE_WIDTH * TILE_HEIGHT;
+            auto total_size_bytes = ((stream->n_elements * stream->element_size + page_size - 1) / page_size) * page_size;
             tt_metal::InterleavedBufferConfig config = {
                 .device = runtime->device,
-                .size = stream->n_elements * stream->element_size,
-                .page_size = stream->element_size * TILE_WIDTH * TILE_HEIGHT, // TODO: Not sure what is optimal for this.
+                .size = total_size_bytes,
+                .page_size = page_size, // TODO: Not sure what is optimal for this.
                 .buffer_type = tt_metal::BufferType::DRAM
             };
             std::cout << "STREAM " << i << ": size: " << config.size << std::endl;
@@ -441,13 +444,14 @@ void Map::execute() {
     tt_metal::EnqueueProgram(runtime->device->command_queue(), runtime->program, false);
     tt_metal::Finish(runtime->device->command_queue());
     auto end = std::chrono::steady_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    tt::log_info("[CURRENT] Program execution completed! Time taken: {}us", duration.count());
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // tt::log_info("[CURRENT] Program execution completed! Time taken: {}us", duration.count());
     // auto total_bytes = streams[0]->n_elements * streams[0]->element_size;
     // tt::log_info("[CURRENT] Total bytes transferred: {}", total_bytes);
     // double total_seconds = duration.count() / 1000.0;
     // tt::log_info("[CURRENT] Total throughput: {} GB/s", (total_bytes / total_seconds) / 1e9);
     // tt_metal::CloseDevice(runtime.device);
+    return end - start;
 }
 
 Map::~Map() {

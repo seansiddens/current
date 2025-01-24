@@ -1,4 +1,5 @@
 #include <vector>
+#include <chrono>
 
 #include "common.hpp"
 
@@ -17,7 +18,7 @@ class Map {
     void add_connection(Kernel *src, std::string src_out, Kernel *dst, std::string dst_in);
     void add_connection(Stream *src, Kernel *dst, std::string dst_in);
     void add_connection(Kernel *src, std::string src_out, Stream *dst);
-    void execute();
+    std::chrono::steady_clock::duration execute();
     void generate_device_kernels();
     void check_connections();
     void propagate_counts();
