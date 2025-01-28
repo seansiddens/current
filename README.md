@@ -150,11 +150,11 @@ This allows for further pipeline parallelism to be extracted from programs. The 
     }
 ```
 
-If our program had a connection between kernel A and kernel B, and these kernels were mapped to Tensix cores 0 and 1 respectively, then the above writer kernel would be generated to run on core 0 and the above reader would be generated to run on core 1.
+If our program had a connection between port `out0` of kernel A to port `in0` of kernel B, and these kernels were mapped to Tensix cores 0 and 1 respectively, then the above writer kernel would be generated to run on core 0 and the above reader would be generated to run on core 1.
 
 
 ## Gather Streams
-The features described thus far would only allow for the specification of data paralell operations across contiguous memory.
+The features described thus far would only allow for the specification of data parallel operations across contiguous memory.
 A useful construct would be that of a **gather stream**, which is a stream of indices into an associated data buffer. 
 This abstraction would essentially allow for random access.
 
