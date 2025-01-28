@@ -109,18 +109,17 @@ void kernel_main() {
     }
 }
 ```
-.
 The computation will wait for data to arrive on it's incoming ports, and then load the data into corresponding vector registers (`in0` is read from CB 0 gets mapped to register `0`, etc).
 The programmer specified compute kernel is executed elementwise on the incoming tiles.
 
 ## Pipeline Parallelism
 The above example showcases how *inter-tile* synchronization is implicitly handled by the framework. 
 Input and output circular buffer management as well as SFPU/FPU contention within the compute core is handled automatically.
-Additionally, when calling `Map` constructor, an optional `max_parallelization_factor` can be supplied. This argument tells the framework to attempt to automatically parallelize parts of the computation graph across multiple Tensix tiles.
+Additionally, when calling the `Map` constructor, an optional `max_parallelization_factor` can be supplied. This argument tells the framework to attempt to automatically parallelize parts of the computation graph across multiple Tensix tiles.
 This can be trivially done, since in our model data elements within streams are computed on in parallel, so a static partitioning of the stream records across multiple Tensix tiles is a trivial (naive) approach.
 
-The framework also allows for implict `intra-tile` synchronization via kernel-to-kernel connections. 
-This further allows for further pipeline parallelism to be extracted from programs. The main difference with regards to kernel generation for these type of programs is we must generate writer and reader kernels which correctly implement a producer/consumer relationship:
+The framework also allows for implict *intra-tile* synchronization via kernel-to-kernel connections. 
+This allows for further pipeline parallelism to be extracted from programs. The main difference with regards to kernel generation for these type of programs is we must generate writer and reader kernels which correctly implement a producer/consumer relationship:
 
 ### Generated Writer (Producer) Kernel
 
@@ -193,12 +192,12 @@ This abstraction would essentially allow for random access.
     }
 ```
 
-The above snippet is the generated reader kernel for a gather stream.
+The above snippet is the generated reader kernel for a gather stream with two accesses per token (e.g for every computation done in parallel, we read two inputs).
 The Tenstorrent architecture is not optimzed for fine-grained non-contiguous access from DRAM, and I found that attempting to read DRAM addresses that were not 32 byte aligned failed.
 The naive solution I implemented was to simply pad the data elements such that every record would be at a 32 byte boundary.
 The reader kernel first reads in a tile of indices, and then each index is used to fetch an element from DRAM and is written to a CB.
 
-This approach is obviously incredibly inefficient, so I included an option to tell the framework to attempt to store the entire data buffer in SRAM. This removes the need for inefficient memory padding or unneeded DRAM accesses.
+This approach is obviously incredibly inefficient, so I included an option to tell the framework to attempt to store the entire data buffer in SRAM. This removes the need for inefficient memory padding and unneeded DRAM accesses.
 
 
 ## Future Work
@@ -206,7 +205,14 @@ The goal of this project is to act as a proof of concept for how to make Tenstor
 The framework automatically handles inter- and intra-Tensix synchronization to a degree, but is still quite limited in it's programming model.
 Future work could build off of this framework to expose a more intuitive and flexible interface and/or DSL.
 Additionally, exposing the SRAM scratchpad memories to exploit data re-use should be further explored.
+I believe that implementing a DSL for a workload such as stencil computations by building off this framework would be feasible, and the regular access patterns of the domain would make it easier to optimally use the scratchpad memories.
+Compiling CUDA/OpenCL/OpenMP kernels for Tenstorrent hardware would also be extremely interesting, but would require a lot more in mapping more general computation patterns to the dataflow optimzed for TT architecture.
 
-Please email me (`seansiddens[at]gmail[dot]com`) or DM me on the Tenstorrent discord (`@.sren`) if you have any further questions/suggestions.
+
+
+Please email me (`seansiddens[at]gmail[dot]com`) or DM me on the Tenstorrent discord (`@.sren`) if you have any further questions/suggestions. Thanks!
+
+This project originated as a class project for a graduate-level high-performance computer architecture course.
+The associated paper contains additional background motivations and discussion on runtime optimizations.
 
 
