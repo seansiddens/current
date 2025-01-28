@@ -213,6 +213,6 @@ Compiling CUDA/OpenCL/OpenMP kernels for Tenstorrent hardware would also be extr
 Please email me (`seansiddens[at]gmail[dot]com`) or DM me on the Tenstorrent discord (`@.sren`) if you have any further questions/suggestions. Thanks!
 
 This project originated as a class project for a graduate-level high-performance computer architecture course.
-The associated paper contains additional background motivations and discussion on runtime optimizations.
+The [associated paper](https://drive.google.com/file/d/1e9T6n1VqPHwG7ibxne4tWLDdGI1JwPL8/view?usp=sharing) contains additional background motivations and discussion on runtime optimizations.
 
 
